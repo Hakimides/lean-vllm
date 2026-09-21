@@ -1,0 +1,51 @@
+# Byte-compiled / cached
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build
+.Python
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+.eggs/
+MANIFEST
+
+# Virtual environments
+.venv
+venv/
+env/
+ENV/
+.env
+
+# Machine-local settings (model paths, etc.)
+local_settings.py
+
+# Logs
+*.log
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+cover/
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+
+# Editors / IDEs
+.idea/
+.vscode/
+.spyderproject
+.ropeproject
+
+# OS
+.DS_Store
