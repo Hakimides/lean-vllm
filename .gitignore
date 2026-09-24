@@ -24,6 +24,16 @@ ENV/
 # Machine-local settings (model paths, etc.)
 local_settings.py
 
+# 只在本地保留、不推仓库的部分
+
+# 实验输出的逐请求原始数据：硬件绑定，换机器复现不了，记录以表格形式留档
+benchmarks/results/
+
+# 过程记录与规范文档
+过程收获.md
+benchmarks/测试标准.md
+benchmarks/基线结果/
+
 # Logs
 *.log
 
