@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+from dataclasses import fields, replace
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -43,6 +43,23 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        # 长度校验：一条序列的 prompt + 输出不能超过 max_model_len。
+        #
+        # 超了会崩，而且崩得很远：capture_cudagraph() 按 max_model_len 预留了
+        # decode 用的 page table，列数写死为 ceil(max_model_len / page_size)。
+        # 序列一旦长过 max_model_len，page table 就要更多列，往那张表里拷的时候
+        # 形状对不上，直接抛异常。
+        #
+        # 这里的处理办法和别家引擎一样：把请求的输出长度截到剩余预算，而不是放它跑。
+        max_model_len = self.model_runner.config.max_model_len
+        budget = max_model_len - len(prompt)
+        if budget <= 0:
+            raise ValueError(
+                f"prompt 已经占满 max_model_len={max_model_len}（实际 {len(prompt)}），没有位置生成输出"
+            )
+        if sampling_params.max_tokens > budget:
+            print(f"[warn] max_tokens={sampling_params.max_tokens} 超出剩余预算 {budget}，已截断")
+            sampling_params = replace(sampling_params, max_tokens=budget)
         seq = Request(prompt, sampling_params)
         self.scheduler.add(seq)
 
