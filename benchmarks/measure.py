@@ -1,0 +1,520 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import subprocess
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from lean_vllm import LLM
+
+from benchmarks import workloads
+
+try:
+    from local_settings import MODEL_PATH
+except ImportError:
+    MODEL_PATH = os.environ.get("MODEL_PATH", "")
+
+RESULTS_DIR = Path(__file__).parent / "results"
+
+
+def _pct(values: list[float], q: float) -> float:
+    """分位数，没数据时返回 nan 免得抛异常"""
+    return float(np.percentile(values, q)) if values else float("nan")
+
+
+def _git_provenance() -> dict:
+    """这份数据是哪次提交跑出来的，dirty 表示当时有未提交改动"""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return {"commit": commit or None, "dirty": bool(dirty)}
+    except Exception:
+        return {"commit": None, "dirty": None}
+
+
+def _gpu_state() -> dict | None:
+    """取一次 GPU 状态，取不到返回 None"""
+    query = ("clocks.sm,clocks.max.sm,temperature.gpu,power.draw,"
+             "clocks_throttle_reasons.active")
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        text = out.stdout.strip()
+        if out.returncode != 0 or not text:
+            return None
+
+        def num(field: str):
+            try:
+                return float(field.split()[0])
+            except (ValueError, IndexError):
+                return None
+
+        parts = [p.strip() for p in text.split(",")]
+        return {
+            "raw": text,
+            "sm_mhz": num(parts[0]) if len(parts) > 0 else None,
+            "sm_max_mhz": num(parts[1]) if len(parts) > 1 else None,
+            "temp_c": num(parts[2]) if len(parts) > 2 else None,
+            "power_w": num(parts[3]) if len(parts) > 3 else None,
+            "throttle": parts[4] if len(parts) > 4 else None,
+        }
+    except Exception:
+        return None
+
+
+@dataclass
+class Rec:
+    """一条请求的观测记录，时刻都是 perf_counter 的绝对时间"""
+
+    shape: str
+    n_out: int                          # 期望生成多少 token
+    planned: float                      # 计划到达时刻
+    t_add: float = 0.0                  # 实际进引擎的时刻
+    t_accept: float | None = None       # 首次被受理拿到 KV page 的时刻
+    token_times: list[float] = field(default_factory=list)
+    had_pages: bool = False             # 用来识别被抢占
+    n_preempt: int = 0                  # 这条被抢占了几次
+
+
+def _summarize(reqs: list[dict]) -> dict:
+    """把逐条数据汇总成分位数"""
+    def col(key):
+        return [r[key] for r in reqs if r[key] == r[key]]      # 顺手滤掉 nan
+
+    ttft, queue, prefill = col("ttft_ms"), col("queue_ms"), col("prefill_ms")
+    e2e = col("e2e_ms")
+    itls = [x for r in reqs for x in r["itls"]]
+    return {
+        "n": len(reqs),
+        "output_tokens": sum(r["n_out"] for r in reqs),
+        "ttft_ms": {
+            "p50": _pct(ttft, 50), "p99": _pct(ttft, 99),
+            "mean": float(np.mean(ttft)) if ttft else float("nan"),
+            "max": max(ttft) if ttft else float("nan"),
+        },
+        "queue_ms": {"p50": _pct(queue, 50), "p99": _pct(queue, 99)},
+        "prefill_ms": {"p50": _pct(prefill, 50), "p99": _pct(prefill, 99)},
+        "e2e_ms": {"p50": _pct(e2e, 50), "p99": _pct(e2e, 99)},
+        "itl_ms": {
+            "p50": _pct(itls, 50), "p99": _pct(itls, 99),
+            "mean": float(np.mean(itls)) if itls else float("nan"),
+            "max": max(itls) if itls else float("nan"),
+        },
+    }
+
+
+def _drain(llm: LLM) -> None:
+    """把引擎里剩下的请求跑完"""
+    while not llm.is_finished():
+        llm.step()
+
+
+def _clock_ramp(samples: list[list], window_s: float = 30.0,
+                tol_mhz: float = 60.0) -> dict | None:
+    """频率还在不在爬升，比最后 window_s 秒前后两半的中位数"""
+    if not samples:
+        return None
+    t_end = samples[-1][0]
+    win = [s for s in samples if s[0] >= t_end - window_s and s[1] is not None]
+    if len(win) < 6:
+        return None
+    half = len(win) // 2
+    a = float(statistics.median([s[1] for s in win[:half]]))
+    b = float(statistics.median([s[1] for s in win[half:]]))
+    return {
+        "first_half_median_mhz": round(a, 1),
+        "last_half_median_mhz": round(b, 1),
+        "delta_mhz": round(b - a, 1),
+        "stable": abs(b - a) <= tol_mhz,
+        "window_s": window_s,
+        "n_samples": len(win),
+    }
+
+
+def _warmup_gpu(llm: LLM, vocab_size: int, seconds: float, target_inflight: int,
+                seed: int, max_model_len: int, tol_mhz: float,
+                period_s: float = 2.0) -> dict:
+    """GPU 暖机：用持续饱和负载把频率顶上去，期间采频率判断有没有稳"""
+    pool = workloads.build_requests(
+        vocab_size,
+        workloads.WorkloadConfig(n_requests=512, lam=4.0, seed=seed,
+                                 max_model_len=max_model_len),
+    )
+    samples: list[list] = []              # [相对秒, SM频率MHz, 温度, 功耗]
+    idx = 0
+    t0 = time.perf_counter()
+    next_sample = 0.0
+    while True:
+        elapsed = time.perf_counter() - t0
+        inflight = len(llm.scheduler.running) + len(llm.scheduler.waiting)
+        # 补足在跑条数；引擎可能因为页不够拒绝受理，那 inflight 就不再涨
+        while inflight < target_inflight and idx < len(pool):
+            req = pool[idx]
+            llm.add_request(req.prompt_ids, req.sampling)
+            idx += 1
+            inflight += 1
+        # 引擎空着时 step() 会触发调度器的 assert，必须先判这个
+        if inflight == 0 and idx >= len(pool):
+            break
+        if elapsed >= seconds:
+            break
+        if elapsed >= next_sample:
+            st = _gpu_state()
+            if st and st["sm_mhz"] is not None:
+                samples.append([round(elapsed, 2), st["sm_mhz"], st["temp_c"], st["power_w"]])
+            next_sample = elapsed + period_s
+        llm.step()
+
+    _drain(llm)
+    ramp = _clock_ramp(samples, tol_mhz=tol_mhz)
+    clocks = [s[1] for s in samples if s[1] is not None]
+    return {
+        "load_s": round(seconds, 1),
+        "inflight": target_inflight,
+        "seed": seed,
+        "n_samples": len(samples),
+        "clock_min_mhz": min(clocks) if clocks else None,
+        "clock_max_mhz": max(clocks) if clocks else None,
+        "ramp": ramp,
+        "trace": samples,
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="按泊松到达在引擎上跑一批请求并测延迟")
+    ap.add_argument("--tag", default="run", help="实验名，决定输出文件名")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--n", type=int, default=256, help="请求总数")
+    ap.add_argument("--lam", type=float, default=4.0, help="平均到达率，条每秒")
+    ap.add_argument("--max-model-len", type=int, default=4096)
+    ap.add_argument("--warmup-gpu-s", type=float, default=45.0,
+                    help="GPU 暖机用持续饱和负载顶频率的秒数，0 表示不做")
+    ap.add_argument("--warmup-inflight", type=int, default=32,
+                    help="预热期间保持多少条请求在跑")
+    ap.add_argument("--warmup-clock-tol", type=float, default=60.0,
+                    help="判频率不再爬升的阈值 MHz")
+    ap.add_argument("--warmup-seed", type=int, default=-1,
+                    help="预热负载的种子，-1 表示用 seed+1000")
+    ap.add_argument("--gpu-sample-s", type=float, default=0.0,
+                    help="运行中采 GPU 状态的间隔秒数，0 表示不采")
+    ap.add_argument("--model", default=MODEL_PATH)
+    ap.add_argument("--out", default=None, help="输出路径，默认写进 benchmarks/results/")
+    args = ap.parse_args()
+
+    if not args.model:
+        ap.error("没有模型路径：请写 lean-vllm/local_settings.py 或设 MODEL_PATH 环境变量")
+
+    llm = LLM(args.model, enforce_eager=False, max_model_len=args.max_model_len)
+    # 随机 token id 的上界和长度预算都从引擎配置取，和引擎用同一套数
+    cfg = workloads.WorkloadConfig(
+        n_requests=args.n,
+        lam=args.lam,
+        seed=args.seed,
+        max_model_len=llm.model_runner.config.max_model_len,
+    )
+    requests = workloads.build_requests(llm.model_runner.config.hf_config.vocab_size, cfg)
+    print(f"负载：{workloads.describe(requests)}")
+    print(workloads.shape_table(requests))
+
+    warmup = None
+    if args.warmup_gpu_s > 0:
+        warmup_seed = args.seed + 1000 if args.warmup_seed < 0 else args.warmup_seed
+        print(f"\nGPU 暖机：持续饱和负载 {args.warmup_gpu_s:.0f}s"
+              f"（保持 {args.warmup_inflight} 条在跑）...", flush=True)
+        warmup = _warmup_gpu(
+            llm, llm.model_runner.config.hf_config.vocab_size,
+            args.warmup_gpu_s, args.warmup_inflight, warmup_seed,
+            llm.model_runner.config.max_model_len, args.warmup_clock_tol,
+        )
+        ramp = warmup["ramp"]
+        if ramp is None:
+            print(f"  预热期只采到 {warmup['n_samples']} 个频率样本，判不了稳不稳")
+        else:
+            print(f"  频率 前半 {ramp['first_half_median_mhz']:.0f} -> "
+                  f"后半 {ramp['last_half_median_mhz']:.0f} MHz"
+                  f"（{ramp['delta_mhz']:+.0f}）"
+                  f" | 区间 {warmup['clock_min_mhz']:.0f}~{warmup['clock_max_mhz']:.0f}")
+            if ramp["stable"]:
+                print("  频率已不再爬升，可以开测")
+            else:
+                print(f"  频率还在爬升（|{ramp['delta_mhz']:+.0f}| > "
+                      f"{args.warmup_clock_tol:.0f} MHz），把 --warmup-gpu-s 调大再跑")
+    if torch.cuda.is_available():
+        # 放在暖机之后。预热用 32 条并发，峰值会高于正式负载，不能算进去
+        torch.cuda.reset_peak_memory_stats()
+
+    # ------------------------------------------------------------------
+    # 主循环：按到达时刻表提交，自己驱动 step()
+    # ------------------------------------------------------------------
+    records: list[Rec] = []
+    live: list[tuple[object, Rec]] = []      # (引擎里的 seq 对象, 记录)
+    # 每步一行：[是不是 prefill 步, 耗时 ms, 在跑条数, 在等条数, 这步处理几个 token]
+    step_log: list[list] = []
+    n_preempt = 0
+    n_prefill_steps = n_decode_steps = 0
+    prefill_tokens = 0
+    phase_ms = [0.0, 0.0]                    # prefill 和 decode 各自累计的毫秒
+    idle_s = 0.0                             # 引擎空转等到达的累计秒数
+    nxt = 0                                  # 下一条待提交的请求下标
+
+    gpu_before = _gpu_state()
+    gpu_trace: list[list] = []               # [相对秒, SM频率MHz, 温度, 功耗]
+    next_gpu_sample = 0.0
+    t0 = time.perf_counter()
+    while nxt < len(requests) or not llm.is_finished():
+        elapsed = time.perf_counter() - t0
+
+        # 1 把已经到点的请求提交进引擎
+        while nxt < len(requests) and requests[nxt].arrival <= elapsed:
+            req = requests[nxt]
+            rec = Rec(shape=req.shape, n_out=req.sampling.max_tokens, planned=req.arrival)
+            rec.t_add = time.perf_counter()
+            llm.add_request(req.prompt_ids, req.sampling)
+            # add_request 不返回 seq 对象，只能从 waiting 队尾取；
+            # 取完立刻取，中间不 step，所以 waiting[-1] 就是刚加进去的那条
+            live.append((llm.scheduler.waiting[-1], rec))
+            records.append(rec)
+            nxt += 1
+
+        # 2 引擎空着就等到下一条到达，不要空转 step
+        if llm.is_finished():
+            t_idle = time.perf_counter()
+            time.sleep(max(0.0, (t0 + requests[nxt].arrival) - t_idle))
+            idle_s += time.perf_counter() - t_idle
+            continue
+
+        # 3 采样 GPU 状态。放在 step 计时之外，不污染步耗时
+        if args.gpu_sample_s > 0 and elapsed >= next_gpu_sample:
+            st = _gpu_state()
+            if st:
+                gpu_trace.append([round(elapsed, 2), st["sm_mhz"], st["temp_c"], st["power_w"]])
+            next_gpu_sample = elapsed + args.gpu_sample_s
+
+        # 4 跑一步
+        s = time.perf_counter()
+        _, num_tokens = llm.step()
+        e = time.perf_counter()
+        step_ms = (e - s) * 1000
+        is_prefill_step = num_tokens > 0
+        step_log.append([
+            is_prefill_step,
+            round(step_ms, 3),
+            len(llm.scheduler.running),
+            len(llm.scheduler.waiting),
+            abs(num_tokens),
+        ])
+        phase_ms[0 if is_prefill_step else 1] += step_ms
+        if is_prefill_step:
+            n_prefill_steps += 1
+            prefill_tokens += num_tokens
+        else:
+            n_decode_steps += 1
+
+        # 5 扫还活着的请求，看谁这步吐了 token、谁被受理、谁被抢占。
+        #   这段开销落在 step() 之外，不污染 step_log 里的耗时；
+        #   但它算在实际耗时里，所以下面的吞吐数字略微偏保守。
+        still_live = []
+        for seq, rec in live:
+            # 受理发生在这一步开始时的 schedule() 里，所以记步开始时刻 s，
+            # 记成步结束时刻 e 的话 prefill 时间永远是 0
+            if rec.t_accept is None and (seq.page_table or rec.token_times):
+                rec.t_accept = s
+            n = seq.num_completion_tokens
+            if n > len(rec.token_times):
+                rec.token_times.extend([e] * (n - len(rec.token_times)))
+            if seq.is_finished:
+                continue
+            # 被抢占的表现是 page_table 被清空（PageManager.release 干的）。
+            # 只算先前拿到过 page 的，否则会把还没轮到的误判成抢占。
+            if seq.page_table:
+                rec.had_pages = True
+            elif rec.had_pages:
+                n_preempt += 1
+                rec.n_preempt += 1
+                rec.had_pages = False
+            still_live.append((seq, rec))
+        live = still_live
+    t_end = time.perf_counter()
+    gpu_after = _gpu_state()
+
+    wall = t_end - t0
+
+    # ------------------------------------------------------------------
+    # 汇总
+    # ------------------------------------------------------------------
+    per_request: list[dict] = []
+    for rec in records:
+        if not rec.token_times:
+            continue
+        itls = [round((b - a) * 1000, 3) for a, b in zip(rec.token_times, rec.token_times[1:])]
+        row = {
+            "shape": rec.shape,
+            "planned_s": round(rec.planned, 4),
+            "arrival_lag_ms": round((rec.t_add - t0 - rec.planned) * 1000, 3),
+            "n_out": rec.n_out,
+            "n_preempt": rec.n_preempt,
+            "ttft_ms": round((rec.token_times[0] - rec.t_add) * 1000, 3),
+            "e2e_ms": round((rec.token_times[-1] - rec.t_add) * 1000, 3),
+            "itls": itls,
+        }
+        row["queue_ms"] = (
+            round((rec.t_accept - rec.t_add) * 1000, 3) if rec.t_accept is not None else float("nan")
+        )
+        row["prefill_ms"] = (
+            round((rec.token_times[0] - rec.t_accept) * 1000, 3) if rec.t_accept is not None else float("nan")
+        )
+        per_request.append(row)
+
+    total_out = sum(r["n_out"] for r in per_request)
+    prompt_tokens = sum(len(req.prompt_ids) for req in requests)
+    overall = _summarize(per_request)
+    # 吞吐用整轮口径（总输出除以总实际耗时）。到达率低时它等于实际交付量，
+    # 到达率高时它等于饱和吞吐
+    overall["throughput"] = {
+        "output_tok_s": total_out / wall,
+        "total_tok_s": (total_out + prompt_tokens) / wall,
+        "prefill_tok_s": prefill_tokens / wall,
+    }
+    overall["wall_s"] = wall
+    overall["arrival_span_s"] = max(req.arrival for req in requests)
+    overall["achieved_arrival_rate"] = len(requests) / overall["arrival_span_s"]
+    overall["n_steps"] = len(step_log)
+    overall["n_prefill_steps"] = n_prefill_steps
+    overall["n_decode_steps"] = n_decode_steps
+    overall["n_preemptions"] = n_preempt
+
+    # 两段加起来约等于实际耗时减去空闲等待
+    overall["phase_ms"] = {"prefill_total": phase_ms[0], "decode_total": phase_ms[1]}
+    overall["idle_s"] = idle_s
+
+    # 批大小用于解释 decode 效率，队列深度是排队的直接证据
+    runnings = [row[2] for row in step_log]
+    waitings = [row[3] for row in step_log]
+    overall["concurrency"] = {
+        "max_running": max(runnings) if runnings else 0,
+        "mean_running": round(float(np.mean(runnings)), 2) if runnings else 0.0,
+        "max_waiting": max(waitings) if waitings else 0,
+    }
+
+    # 重算量等于 prefill 处理的 token 减去原始 prompt 总量。
+    # 这个等式成立的前提是前缀缓存命中为 0，换成真实语料后就不再是纯重算量
+    overall["recompute_tokens"] = prefill_tokens - prompt_tokens
+
+    overall["arrival_lag_ms"] = {
+        "p50": _pct([r["arrival_lag_ms"] for r in per_request], 50),
+        "p99": _pct([r["arrival_lag_ms"] for r in per_request], 99),
+        "max": max((r["arrival_lag_ms"] for r in per_request), default=float("nan")),
+    }
+
+    memory = None
+    if torch.cuda.is_available():
+        memory = {
+            "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+            "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        }
+        overall["memory"] = memory
+
+    # KV 容量是解释结果的关键，待处理 token 总量超过它就只能靠抢占加重算腾地方
+    page_size = llm.scheduler.page_size
+    num_pages = llm.model_runner.config.num_kvcache_pages
+    kv_capacity = num_pages * page_size
+    overall["engine"] = {
+        "max_num_batched_tokens": llm.scheduler.max_num_batched_tokens,
+        "max_num_seqs": llm.scheduler.max_num_seqs,
+        "max_model_len": llm.model_runner.config.max_model_len,
+        "page_size": page_size,
+        "num_kvcache_pages": num_pages,
+        "kv_capacity_tokens": kv_capacity,
+    }
+
+    # ------------------------------------------------------------------
+    # 打印
+    # ------------------------------------------------------------------
+    o = overall
+    print(
+        f"\n实际耗时 {wall:.2f}s | 到达跨度 {o['arrival_span_s']:.1f}s "
+        f"（{o['achieved_arrival_rate']:.2f} 条/s）| {len(step_log)} 步"
+        f"（prefill {n_prefill_steps} / decode {n_decode_steps}）"
+        f"| 抢占 {o['n_preemptions']} 次"
+    )
+    print(
+        f"吞吐：输出 {o['throughput']['output_tok_s']:.0f} tok/s"
+        f" | 含 prompt {o['throughput']['total_tok_s']:.0f} tok/s"
+    )
+    print(
+        f"耗时去向：prefill {phase_ms[0] / 1000:.1f}s + decode {phase_ms[1] / 1000:.1f}s"
+        f" + 空闲 {idle_s:.1f}s = {wall:.1f}s"
+    )
+    print(
+        f"并发度：max {o['concurrency']['max_running']}"
+        f" / 均值 {o['concurrency']['mean_running']}"
+        f" | 队列最深 {o['concurrency']['max_waiting']}"
+        f" | 重算 {o['recompute_tokens']} token"
+        f"（prefill 总量的 {100 * o['recompute_tokens'] / max(1, prompt_tokens):.1f}%）"
+    )
+    print(
+        f"延迟 ms：TTFT p50 {o['ttft_ms']['p50']:.0f} / p99 {o['ttft_ms']['p99']:.0f}"
+        f" | 排队 p50 {o['queue_ms']['p50']:.2f}"
+        f" | prefill p50 {o['prefill_ms']['p50']:.0f}"
+        f" | E2E p50 {o['e2e_ms']['p50']:.0f} / p99 {o['e2e_ms']['p99']:.0f}"
+    )
+    print(
+        f"ITL ms：p50 {o['itl_ms']['p50']:.2f} / p99 {o['itl_ms']['p99']:.2f}"
+        f" / max {o['itl_ms']['max']:.0f}"
+    )
+    lag = o["arrival_lag_ms"]
+    print(f"到达偏差：p50 {lag['p50']:.2f} / p99 {lag['p99']:.2f} ms")
+    if memory:
+        print(f"显存峰值：已分配 {memory['peak_allocated_mib']:.0f} MiB")
+    need = total_out + prompt_tokens
+    print(f"KV 容量 {kv_capacity} tokens | 负载总量 {need} tokens（{need / kv_capacity:.1f} 倍）")
+    if gpu_before or gpu_after:
+        print(f"GPU 跑前 {gpu_before} | 跑后 {gpu_after}")
+
+    # ------------------------------------------------------------------
+    # 落盘
+    # ------------------------------------------------------------------
+    payload = {
+        "tag": args.tag,
+        "provenance": _git_provenance(),
+        "model": args.model,
+        "workload_config": asdict(cfg),
+        "workload_desc": workloads.describe(requests),
+        "gpu_sample": {"period_s": args.gpu_sample_s},
+        # 暖机报告含预热期的频率轨迹，正式测量关采样时频率信息靠这里
+        "warmup": warmup,
+        "env": {
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "gpu_before": gpu_before,
+            "gpu_after": gpu_after,
+        },
+        "overall": overall,
+        "per_request": per_request,
+        "step_log": step_log,
+        "gpu_trace": gpu_trace,
+    }
+    out_path = Path(args.out) if args.out else RESULTS_DIR / f"{args.tag}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"\n已写入 {out_path}")
+
+
+if __name__ == "__main__":
+    main()
