@@ -97,7 +97,7 @@ class EngineRunner:
         seqs = [Request([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.scheduled_len = seq_len
-        self.run(seqs, True)
+        self.run(seqs)
         torch.cuda.empty_cache()
 
     def acquire_kv_cache(self):
@@ -126,27 +126,50 @@ class EngineRunner:
         page_tables = torch.tensor(page_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return page_tables
 
-    def prepare_prefill(self, seqs: list[Request]):
+    def prepare_batch(self, seqs: list[Request]):
+        """把一批请求摊平成一维输入，返回 (input_ids, positions, prefill token 数)。
+
+        每条序列按它自己的状态决定这一步算多少 token：
+          prefill（含分块）：从 cached_len 起，长度 scheduled_len
+          decode：          只算最后 1 个 token，但要读到全部历史 KV
+        两类在同一个循环里处理 —— 混合批的元数据就是这样拼出来的。
+
+        对"整批只有一类"的情形，这里构造出的张量和原来的
+        prepare_prefill / prepare_decode 逐一对应、不多不少。
+        """
+        # decode 步要按每条序列各自的 KV 长度去读；prefill 步不用
+        is_decode_only = all(not seq.is_prefill for seq in seqs)
+
         input_ids = []
         positions = []
+        slot_mapping = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
-        page_tables = None
+        context_lens = []
+        num_prefill_tokens = 0
+
         for seq in seqs:
-            start = seq.cached_len
-            seqlen_q = seq.scheduled_len
+            if seq.is_prefill:
+                start = seq.cached_len
+                seqlen_q = seq.scheduled_len
+                num_prefill_tokens += seqlen_q
+            else:
+                start = len(seq) - 1
+                seqlen_q = 1
+                context_lens.append(len(seq))
             end = start + seqlen_q
             seqlen_k = end
+
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.page_table:    # warmup
+
+            if not seq.page_table:    # 预热阶段还没有 KV 页，不往 cache 里写
                 continue
             start_page = start // self.page_size
             end_page = (end + self.page_size - 1) // self.page_size
@@ -159,33 +182,27 @@ class EngineRunner:
                 else:
                     slot_end = seq.page_table[i] * self.page_size + end - i * self.page_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            page_tables = self.prepare_page_tables(seqs)
+
+        # 这个判断必须用 Python 列表做，换成 tensor 会多一次 GPU 同步
+        needs_page_tables = is_decode_only or cu_seqlens_k[-1] > cu_seqlens_q[-1]
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, page_tables)
-        return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Request]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.page_table[-1] * self.page_size + seq.last_page_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        page_tables = self.prepare_page_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, page_tables=page_tables)
-        return input_ids, positions
+        # decode 步必须有 block_table；prefill 步只有命中前缀缓存时才需要
+        # （没命中时 attention 直接用这一步新算出来的 k/v）
+        page_tables = self.prepare_page_tables(seqs) if needs_page_tables else None
+        if is_decode_only:
+            context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        else:
+            context_lens = None
+
+        set_context(num_prefill_tokens, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, context_lens, page_tables)
+        return input_ids, positions, num_prefill_tokens
 
     def prepare_sample(self, seqs: list[Request]):
         temperatures = [seq.temperature for seq in seqs]
@@ -193,8 +210,11 @@ class EngineRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, use_cudagraph: bool):
+        # 只有"整步都是 decode"才走捕获好的图 —— 那些图是按 decode 语义建的
+        # （每行 query_len 都是 1、按 context_lens 读 KV）。混合步的元数据形状
+        # 与它们不同，只能走 eager。
+        if not use_cudagraph:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -211,10 +231,16 @@ class EngineRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Request], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Request]) -> list[int]:
+        input_ids, positions, num_prefill_tokens = self.prepare_batch(seqs)
+        # 整步都是 decode、且批大小在图的覆盖范围内，才用 CUDA graph
+        use_cudagraph = (
+            num_prefill_tokens == 0
+            and not self.enforce_eager
+            and len(seqs) <= 512
+        )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, use_cudagraph)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
@@ -237,7 +263,7 @@ class EngineRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], page_tables=page_tables[:bs])
+            set_context(0, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], page_tables=page_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

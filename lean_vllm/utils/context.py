@@ -4,7 +4,10 @@ import torch
 
 @dataclass(slots=True)
 class Context:
-    is_prefill: bool = False
+    # 本步要算的 prefill token 数；0 表示整步都是 decode。
+    # 用它取代原来的 is_prefill 布尔量，因为混合批里两者同时存在，
+    # 布尔量表达不了。
+    num_prefill_tokens: int = 0
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
@@ -18,9 +21,9 @@ _CONTEXT = Context()
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, page_tables=None):
+def set_context(num_prefill_tokens=0, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, page_tables=None):
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, page_tables)
+    _CONTEXT = Context(num_prefill_tokens, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, page_tables)
 
 def reset_context():
     global _CONTEXT

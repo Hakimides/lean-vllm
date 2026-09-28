@@ -61,8 +61,10 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
-            if context.page_tables is not None:    # prefix cache
+        if context.num_prefill_tokens > 0:
+            # 只要本步含 prefill 就走 varlen：decode 请求在它眼里是 query_len=1 的那种，
+            # 统一由 cu_seqlens_q 描述。纯 decode 才走下面那条更快的专用 kernel。
+            if context.page_tables is not None:    # 前缀缓存命中，或批里含 decode
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
