@@ -55,6 +55,7 @@ class BatchScheduler:
         self.running.extendleft(reversed(scheduled_seqs))
 
         # ---- ② 再用剩下的预算排 waiting：prefill ----
+        skipped: list[Request] = []
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -63,7 +64,11 @@ class BatchScheduler:
             if not seq.page_table:
                 num_cached_pages = self.page_manager.can_acquire(seq)
                 if num_cached_pages == -1:
-                    break
+                    # 页凑不齐：跳过这条、看下一条，而不是 break ——
+                    # 后面的短请求还塞得进来，队首的长 prompt 不该把它们全堵死。
+                    self.waiting.popleft()
+                    skipped.append(seq)
+                    continue
                 num_tokens = seq.num_tokens - num_cached_pages * self.page_size
             else:
                 num_tokens = seq.num_tokens - seq.cached_len
@@ -80,6 +85,10 @@ class BatchScheduler:
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
+
+        # 本轮跳过的插回队首，保持先来后到
+        if skipped:
+            self.waiting.extendleft(reversed(skipped))
 
         assert scheduled_seqs
         return scheduled_seqs, num_prefill_tokens, num_decode
