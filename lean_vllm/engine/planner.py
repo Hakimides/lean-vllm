@@ -22,11 +22,39 @@ class BatchScheduler:
     def add(self, seq: Request):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Request], bool]:
-        scheduled_seqs = []
-        num_batched_tokens = 0
+    def schedule(self) -> tuple[list[Request], int, int]:
+        """排一步，返回 (本步要跑的序列, 本步的 prefill token 数, 本步的 decode 条数)。
 
-        # prefill
+        顺序是刻意的：**先给已经在跑的序列排 decode**（各 1 个 token），
+        剩下的预算才给等待队列做 prefill。原来反着来 —— prefill 独占一整步，
+        一条长 prompt 进来就把所有在跑的序列整步冻住，那是 ITL 尖峰的来源。
+        """
+        scheduled_seqs: list[Request] = []
+        num_batched_tokens = 0
+        num_prefill_tokens = 0
+        num_decode = 0
+
+        # ---- ① 先排 running：decode，各 1 个 token ----
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+            seq = self.running.popleft()
+            # 页不够就抢占，腾出地方
+            while not self.page_manager.can_append(seq):
+                if self.running:
+                    self.evict_running(self.running.pop())
+                else:
+                    self.evict_running(seq)
+                    break
+            else:
+                seq.scheduled_len = 1
+                seq.is_prefill = False
+                self.page_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+                num_batched_tokens += 1
+                num_decode += 1
+        # 排上的放回队首，保持原来的先后
+        self.running.extendleft(reversed(scheduled_seqs))
+
+        # ---- ② 再用剩下的预算排 waiting：prefill ----
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -39,38 +67,22 @@ class BatchScheduler:
                 num_tokens = seq.num_tokens - num_cached_pages * self.page_size
             else:
                 num_tokens = seq.num_tokens - seq.cached_len
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            # 分块只对本步第一条 prefill 开放
+            if remaining < num_tokens and num_prefill_tokens:
                 break
             if not seq.page_table:
                 self.page_manager.acquire(seq, num_cached_pages)
             seq.scheduled_len = min(num_tokens, remaining)
             num_batched_tokens += seq.scheduled_len
+            num_prefill_tokens += seq.scheduled_len
             if seq.cached_len + seq.scheduled_len == seq.num_tokens:
                 seq.status = RequestState.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.page_manager.can_append(seq):
-                if self.running:
-                    self.evict_running(self.running.pop())
-                else:
-                    self.evict_running(seq)
-                    break
-            else:
-                seq.scheduled_len = 1
-                seq.is_prefill = False
-                self.page_manager.may_append(seq)
-                scheduled_seqs.append(seq)
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, num_prefill_tokens, num_decode
 
     def evict_running(self, seq: Request):
         seq.status = RequestState.WAITING

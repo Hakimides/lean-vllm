@@ -264,12 +264,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     records: list[Rec] = []
     live: list[tuple[object, Rec]] = []      # (引擎里的 seq 对象, 记录)
-    # 每步一行：[是不是 prefill 步, 耗时 ms, 在跑条数, 在等条数, 这步处理几个 token]
+    # 每步一行：[prefill token 数, decode 条数, 耗时 ms, 在跑条数, 在等条数]
+    # 一步里两类可以同时有（混合批），所以拆成两列，不再靠符号区分
     step_log: list[list] = []
     n_preempt = 0
-    n_prefill_steps = n_decode_steps = 0
+    n_prefill_steps = n_decode_steps = n_mixed_steps = 0
     prefill_tokens = 0
-    phase_ms = [0.0, 0.0]                    # prefill 和 decode 各自累计的毫秒
+    phase_ms = [0.0, 0.0]                    # 纯 prefill / 纯 decode 步各自累计的毫秒
+    mixed_ms = 0.0                           # 混合步累计的毫秒（不摊到上面两个里，免得重复计）
     idle_s = 0.0                             # 引擎空转等到达的累计秒数
     nxt = 0                                  # 下一条待提交的请求下标
 
@@ -308,23 +310,26 @@ def main() -> None:
 
         # 4 跑一步
         s = time.perf_counter()
-        _, num_tokens = llm.step()
+        _, num_prefill_tokens, num_decode = llm.step()
         e = time.perf_counter()
         step_ms = (e - s) * 1000
-        is_prefill_step = num_tokens > 0
         step_log.append([
-            is_prefill_step,
+            num_prefill_tokens,
+            num_decode,
             round(step_ms, 3),
             len(llm.scheduler.running),
             len(llm.scheduler.waiting),
-            abs(num_tokens),
         ])
-        phase_ms[0 if is_prefill_step else 1] += step_ms
-        if is_prefill_step:
+        prefill_tokens += num_prefill_tokens
+        if num_prefill_tokens and num_decode:
+            n_mixed_steps += 1
+            mixed_ms += step_ms
+        elif num_prefill_tokens:
             n_prefill_steps += 1
-            prefill_tokens += num_tokens
+            phase_ms[0] += step_ms
         else:
             n_decode_steps += 1
+            phase_ms[1] += step_ms
 
         # 5 扫还活着的请求，看谁这步吐了 token、谁被受理、谁被抢占。
         #   这段开销落在 step() 之外，不污染 step_log 里的耗时；
@@ -397,15 +402,20 @@ def main() -> None:
     overall["n_steps"] = len(step_log)
     overall["n_prefill_steps"] = n_prefill_steps
     overall["n_decode_steps"] = n_decode_steps
+    overall["n_mixed_steps"] = n_mixed_steps
     overall["n_preemptions"] = n_preempt
 
-    # 两段加起来约等于实际耗时减去空闲等待
-    overall["phase_ms"] = {"prefill_total": phase_ms[0], "decode_total": phase_ms[1]}
+    # 四段加起来约等于实际耗时减去空闲等待
+    overall["phase_ms"] = {
+        "prefill_total": phase_ms[0],
+        "decode_total": phase_ms[1],
+        "mixed_total": mixed_ms,
+    }
     overall["idle_s"] = idle_s
 
     # 批大小用于解释 decode 效率，队列深度是排队的直接证据
-    runnings = [row[2] for row in step_log]
-    waitings = [row[3] for row in step_log]
+    runnings = [row[3] for row in step_log]
+    waitings = [row[4] for row in step_log]
     overall["concurrency"] = {
         "max_running": max(runnings) if runnings else 0,
         "mean_running": round(float(np.mean(runnings)), 2) if runnings else 0.0,
@@ -450,7 +460,7 @@ def main() -> None:
     print(
         f"\n实际耗时 {wall:.2f}s | 到达跨度 {o['arrival_span_s']:.1f}s "
         f"（{o['achieved_arrival_rate']:.2f} 条/s）| {len(step_log)} 步"
-        f"（prefill {n_prefill_steps} / decode {n_decode_steps}）"
+        f"（prefill {n_prefill_steps} / 混合 {n_mixed_steps} / decode {n_decode_steps}）"
         f"| 抢占 {o['n_preemptions']} 次"
     )
     print(
@@ -459,7 +469,7 @@ def main() -> None:
     )
     print(
         f"耗时去向：prefill {phase_ms[0] / 1000:.1f}s + decode {phase_ms[1] / 1000:.1f}s"
-        f" + 空闲 {idle_s:.1f}s = {wall:.1f}s"
+        f" + 混合 {mixed_ms / 1000:.1f}s + 空闲 {idle_s:.1f}s = {wall:.1f}s"
     )
     print(
         f"并发度：max {o['concurrency']['max_running']}"

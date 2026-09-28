@@ -64,12 +64,18 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.scheduled_len for seq in seqs) if is_prefill else -len(seqs)
+        """排一步、跑一步。返回 (完成的请求, 本步 prefill token 数, 本步 decode 条数)。
+
+        一步里可以同时有 prefill 和 decode，所以不再是一个正负号能表达的
+        （原来用符号区分两类步，混合批之后这个约定失效）。
+        """
+        seqs, num_prefill_tokens, num_decode = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # postprocess 里那个判断自带逐条分流：decode 的 cached_len 已经等于 num_tokens，
+        # 只有还没算完的分块 prefill 才会被它跳过。所以这里传"本步有没有 prefill"即可。
+        self.scheduler.postprocess(seqs, token_ids, num_prefill_tokens > 0)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        return outputs, num_prefill_tokens, num_decode
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -89,11 +95,13 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            output, num_prefill_tokens, num_decode = self.step()
+            elapsed = perf_counter() - t
+            # 一步里两类可能同时有，所以两边分别更新
+            if num_prefill_tokens:
+                prefill_throughput = num_prefill_tokens / elapsed
+            if num_decode:
+                decode_throughput = num_decode / elapsed
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
