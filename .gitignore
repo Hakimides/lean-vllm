@@ -31,6 +31,8 @@ benchmarks/results/
 
 # 过程记录与规范文档
 过程收获.md
+vLLM对照_调度策略.md
+混合批优化.md
 benchmarks/测试标准.md
 benchmarks/基线结果/
 
