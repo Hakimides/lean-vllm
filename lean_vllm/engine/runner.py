@@ -188,9 +188,15 @@ class EngineRunner:
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        # 纯 decode 的步走 flash_attn_with_kvcache，根本不看 cu_seqlens ——
+        # 留着这两个张量只是白做一次 pinned 分配 + H2D，每个 decode 步都要付一遍
+        if num_prefill_tokens > 0:
+            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        else:
+            cu_seqlens_q = cu_seqlens_k = None
 
         # decode 步必须有 block_table；prefill 步只有命中前缀缓存时才需要
         # （没命中时 attention 直接用这一步新算出来的 k/v）
