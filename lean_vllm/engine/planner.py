@@ -10,6 +10,8 @@ class BatchScheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # 准入时不许动用的页数。num_kvcache_pages 由 runner 在构造本对象之前算好
+        self.reserve_pages = int(config.kv_admission_watermark * config.num_kvcache_pages)
         self.eos = config.eos
         self.page_size = config.kvcache_page_size
         self.page_manager = PageManager(config.num_kvcache_pages, config.kvcache_page_size)
@@ -75,6 +77,12 @@ class BatchScheduler:
                         self.waiting.popleft()
                         skipped.append(seq)
                         continue
+                    # 准入余量：收下它之后，空闲页不能低于 reserve_pages。
+                    # 余量不够就 break（别再收了）—— 把 KV 吃干只会逼出反复抢占，
+                    # 而抢占才是 λ=4.0 上尾部炸掉的根因。
+                    if (len(self.page_manager.free_page_ids) - (seq.num_pages - num_cached_pages)
+                            < self.reserve_pages):
+                        break
                     num_tokens = seq.num_tokens - num_cached_pages * self.page_size
                 else:
                     num_tokens = seq.num_tokens - seq.cached_len
