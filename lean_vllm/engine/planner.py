@@ -33,6 +33,7 @@ class BatchScheduler:
         num_batched_tokens = 0
         num_prefill_tokens = 0
         num_decode = 0
+        evicted = False
 
         # ---- ① 先排 running：decode，各 1 个 token ----
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -41,8 +42,10 @@ class BatchScheduler:
             while not self.page_manager.can_append(seq):
                 if self.running:
                     self.evict_running(self.running.pop())
+                    evicted = True
                 else:
                     self.evict_running(seq)
+                    evicted = True
                     break
             else:
                 seq.scheduled_len = 1
@@ -55,40 +58,42 @@ class BatchScheduler:
         self.running.extendleft(reversed(scheduled_seqs))
 
         # ---- ② 再用剩下的预算排 waiting：prefill ----
-        skipped: list[Request] = []
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            if not seq.page_table:
-                num_cached_pages = self.page_manager.can_acquire(seq)
-                if num_cached_pages == -1:
-                    # 页凑不齐：跳过这条、看下一条，而不是 break ——
-                    # 后面的短请求还塞得进来，队首的长 prompt 不该把它们全堵死。
+        # 本步发生过抢占就跳过 prefill —— 抢占说明页已经不够，这时再塞新请求
+        # 只会把在跑的挤得更惨。但一条都没排上时例外，否则这一步就是空的。
+        if not evicted or not scheduled_seqs:
+            skipped: list[Request] = []
+            while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.waiting[0]
+                remaining = self.max_num_batched_tokens - num_batched_tokens
+                if remaining == 0:
+                    break
+                if not seq.page_table:
+                    num_cached_pages = self.page_manager.can_acquire(seq)
+                    if num_cached_pages == -1:
+                        # 页凑不齐：跳过这条、看下一条，而不是 break ——
+                        # 后面的短请求还塞得进来，队首的长 prompt 不该把它们全堵死。
+                        self.waiting.popleft()
+                        skipped.append(seq)
+                        continue
+                    num_tokens = seq.num_tokens - num_cached_pages * self.page_size
+                else:
+                    num_tokens = seq.num_tokens - seq.cached_len
+                # 分块只对本步第一条 prefill 开放
+                if remaining < num_tokens and num_prefill_tokens:
+                    break
+                if not seq.page_table:
+                    self.page_manager.acquire(seq, num_cached_pages)
+                seq.scheduled_len = min(num_tokens, remaining)
+                num_batched_tokens += seq.scheduled_len
+                num_prefill_tokens += seq.scheduled_len
+                if seq.cached_len + seq.scheduled_len == seq.num_tokens:
+                    seq.status = RequestState.RUNNING
                     self.waiting.popleft()
-                    skipped.append(seq)
-                    continue
-                num_tokens = seq.num_tokens - num_cached_pages * self.page_size
-            else:
-                num_tokens = seq.num_tokens - seq.cached_len
-            # 分块只对本步第一条 prefill 开放
-            if remaining < num_tokens and num_prefill_tokens:
-                break
-            if not seq.page_table:
-                self.page_manager.acquire(seq, num_cached_pages)
-            seq.scheduled_len = min(num_tokens, remaining)
-            num_batched_tokens += seq.scheduled_len
-            num_prefill_tokens += seq.scheduled_len
-            if seq.cached_len + seq.scheduled_len == seq.num_tokens:
-                seq.status = RequestState.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
-            scheduled_seqs.append(seq)
-
-        # 本轮跳过的插回队首，保持先来后到
-        if skipped:
-            self.waiting.extendleft(reversed(skipped))
+                    self.running.append(seq)
+                scheduled_seqs.append(seq)
+            # 本轮跳过的插回队首，保持先来后到
+            if skipped:
+                self.waiting.extendleft(reversed(skipped))
 
         assert scheduled_seqs
         return scheduled_seqs, num_prefill_tokens, num_decode
