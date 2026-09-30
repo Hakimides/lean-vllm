@@ -43,14 +43,7 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        # 长度校验：一条序列的 prompt + 输出不能超过 max_model_len。
-        #
-        # 超了会崩，而且崩得很远：capture_cudagraph() 按 max_model_len 预留了
-        # decode 用的 page table，列数写死为 ceil(max_model_len / page_size)。
-        # 序列一旦长过 max_model_len，page table 就要更多列，往那张表里拷的时候
-        # 形状对不上，直接抛异常。
-        #
-        # 这里的处理办法和别家引擎一样：把请求的输出长度截到剩余预算，而不是放它跑。
+        # prompt + 输出超过 max_model_len 时，截断输出长度
         max_model_len = self.model_runner.config.max_model_len
         budget = max_model_len - len(prompt)
         if budget <= 0:
@@ -64,15 +57,10 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        """排一步、跑一步。返回 (完成的请求, 本步 prefill token 数, 本步 decode 条数)。
-
-        一步里可以同时有 prefill 和 decode，所以不再是一个正负号能表达的
-        （原来用符号区分两类步，混合批之后这个约定失效）。
-        """
+        """排一步、跑一步，返回 (完成的请求, prefill token 数, decode 条数)"""
         seqs, num_prefill_tokens, num_decode = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs)
-        # postprocess 里那个判断自带逐条分流：decode 的 cached_len 已经等于 num_tokens，
-        # 只有还没算完的分块 prefill 才会被它跳过。所以这里传"本步有没有 prefill"即可。
+        # postprocess 按每条序列各自的进度决定要不要出 token
         self.scheduler.postprocess(seqs, token_ids, num_prefill_tokens > 0)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_prefill_tokens, num_decode
@@ -97,7 +85,7 @@ class LLMEngine:
             t = perf_counter()
             output, num_prefill_tokens, num_decode = self.step()
             elapsed = perf_counter() - t
-            # 一步里两类可能同时有，所以两边分别更新
+            # 两类吞吐分别更新
             if num_prefill_tokens:
                 prefill_throughput = num_prefill_tokens / elapsed
             if num_decode:

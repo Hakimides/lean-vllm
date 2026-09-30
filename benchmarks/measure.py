@@ -224,8 +224,7 @@ def main() -> None:
     if not args.model:
         ap.error("没有模型路径：请写 lean-vllm/local_settings.py 或设 MODEL_PATH 环境变量")
 
-    # 不给就沿用引擎默认（见 config.py），所以只在显式指定时才传 ——
-    # 否则会把引擎的默认值覆盖成"关"。
+    # 只在显式指定时传给引擎
     engine_kwargs = {}
     if args.kv_watermark is not None:
         engine_kwargs["kv_admission_watermark"] = args.kv_watermark
@@ -268,19 +267,14 @@ def main() -> None:
                 print(f"  频率还在爬升（|{ramp['delta_mhz']:+.0f}| > "
                       f"{args.warmup_clock_tol:.0f} MHz），把 --warmup-gpu-s 调大再跑")
     if torch.cuda.is_available():
-        # 放在暖机之后。预热用 32 条并发，峰值会高于正式负载，不能算进去
+        # 放在暖机之后，避免把预热的峰值算进去
         torch.cuda.reset_peak_memory_stats()
 
-    # ------------------------------------------------------------------
     # 主循环：按到达时刻表提交，自己驱动 step()
-    # ------------------------------------------------------------------
     records: list[Rec] = []
     live: list[tuple[object, Rec]] = []      # (引擎里的 seq 对象, 记录)
-    # 每步一行：[prefill token 数, decode 条数, 耗时 ms, 在跑条数, 在等条数, 驻留 token]
-    # 一步里两类可以同时有（混合批），所以拆成两列，不再靠符号区分。
-    # 第 6 列（驻留 token）= 这一步在跑序列的 KV 长度之和 —— 用来把 decode 步耗时按
-    # 「固定 + 每序列×批 + 每 token×驻留 token」分解；「批」单独解释不了它
-    # （实测并发 27 和 29 的步耗时一样）。纯 decode 步里它正好是这一步要读的 KV 总量。
+    # 每步一行：[prefill token 数, decode 条数, 耗时, 在跑, 在等, 驻留 token]
+    # 驻留 token = 在跑序列的 KV 长度之和
     step_log: list[list] = []
     n_preempt = 0
     n_prefill_steps = n_decode_steps = n_mixed_steps = 0
@@ -303,8 +297,7 @@ def main() -> None:
             rec = Rec(shape=req.shape, n_out=req.sampling.max_tokens, planned=req.arrival)
             rec.t_add = time.perf_counter()
             llm.add_request(req.prompt_ids, req.sampling)
-            # add_request 不返回 seq 对象，只能从 waiting 队尾取；
-            # 取完立刻取，中间不 step，所以 waiting[-1] 就是刚加进去的那条
+            # 只能从 waiting 队尾取刚加进去的那条
             live.append((llm.scheduler.waiting[-1], rec))
             records.append(rec)
             nxt += 1
@@ -349,13 +342,10 @@ def main() -> None:
             n_decode_steps += 1
             phase_ms[1] += step_ms
 
-        # 5 扫还活着的请求，看谁这步吐了 token、谁被受理、谁被抢占。
-        #   这段开销落在 step() 之外，不污染 step_log 里的耗时；
-        #   但它算在实际耗时里，所以下面的吞吐数字略微偏保守。
+        # 5 扫还活着的请求：谁吐了 token、谁被受理、谁被抢占
         still_live = []
         for seq, rec in live:
-            # 受理发生在这一步开始时的 schedule() 里，所以记步开始时刻 s，
-            # 记成步结束时刻 e 的话 prefill 时间永远是 0
+            # 记步开始时刻（受理发生在 schedule() 里）
             if rec.t_accept is None and (seq.page_table or rec.token_times):
                 rec.t_accept = s
             n = seq.num_completion_tokens
@@ -363,8 +353,7 @@ def main() -> None:
                 rec.token_times.extend([e] * (n - len(rec.token_times)))
             if seq.is_finished:
                 continue
-            # 被抢占的表现是 page_table 被清空（PageManager.release 干的）。
-            # 只算先前拿到过 page 的，否则会把还没轮到的误判成抢占。
+            # page_table 被清空即为被抢占，只算先前拿到过 page 的
             if seq.page_table:
                 rec.had_pages = True
             elif rec.had_pages:
@@ -378,9 +367,7 @@ def main() -> None:
 
     wall = t_end - t0
 
-    # ------------------------------------------------------------------
     # 汇总
-    # ------------------------------------------------------------------
     per_request: list[dict] = []
     for rec in records:
         if not rec.token_times:
@@ -407,8 +394,7 @@ def main() -> None:
     total_out = sum(r["n_out"] for r in per_request)
     prompt_tokens = sum(len(req.prompt_ids) for req in requests)
     overall = _summarize(per_request)
-    # 吞吐用整轮口径（总输出除以总实际耗时）。到达率低时它等于实际交付量，
-    # 到达率高时它等于饱和吞吐
+    # 吞吐用整轮口径（总输出除以总实际耗时）
     overall["throughput"] = {
         "output_tok_s": total_out / wall,
         "total_tok_s": (total_out + prompt_tokens) / wall,
@@ -440,8 +426,7 @@ def main() -> None:
         "max_waiting": max(waitings) if waitings else 0,
     }
 
-    # 重算量等于 prefill 处理的 token 减去原始 prompt 总量。
-    # 这个等式成立的前提是前缀缓存命中为 0，换成真实语料后就不再是纯重算量
+    # 重算量 = prefill 处理的 token 减去原始 prompt 总量
     overall["recompute_tokens"] = prefill_tokens - prompt_tokens
 
     overall["arrival_lag_ms"] = {
@@ -471,9 +456,7 @@ def main() -> None:
         "kv_capacity_tokens": kv_capacity,
     }
 
-    # ------------------------------------------------------------------
     # 打印
-    # ------------------------------------------------------------------
     o = overall
     print(
         f"\n实际耗时 {wall:.2f}s | 到达跨度 {o['arrival_span_s']:.1f}s "
@@ -515,9 +498,7 @@ def main() -> None:
     if gpu_before or gpu_after:
         print(f"GPU 跑前 {gpu_before} | 跑后 {gpu_after}")
 
-    # ------------------------------------------------------------------
     # 落盘
-    # ------------------------------------------------------------------
     payload = {
         "tag": args.tag,
         "provenance": _git_provenance(),
@@ -525,8 +506,7 @@ def main() -> None:
         "workload_config": asdict(cfg),
         "workload_desc": workloads.describe(requests),
         "gpu_sample": {"period_s": args.gpu_sample_s},
-        # 记引擎里**实际生效**的值，而不是命令行参数 —— 不指定时参数是 None，
-        # 记下来等于没说；这几个是算完之后的真数。
+        # 记引擎里实际生效的值
         "sched_knobs": {
             "kv_admission_watermark": llm.model_runner.config.kv_admission_watermark,
             "reserve_pages": llm.scheduler.reserve_pages,

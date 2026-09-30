@@ -56,8 +56,7 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.num_prefill_tokens > 0:
-            # 每条序列只拿最后一个 token 算 logits。纯 decode 时这个索引恰好是
-            # [0, 1, ..., bs-1]，取出来和"整个张量"等价 —— 所以那里可以跳过这步。
+            # prefill 时每条序列只取最后一个 token 算 logits
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)

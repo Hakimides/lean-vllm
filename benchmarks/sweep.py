@@ -32,14 +32,10 @@ def _run_one(tag: str, seed: int, n: int, lam: float) -> dict:
     return json.loads((RESULTS_DIR / f"{tag}.json").read_text(encoding="utf-8"))
 
 
-# ----------------------------------------------------------------------
 # 汇总
-# ----------------------------------------------------------------------
 
 def _pooled_metrics(runs: list[dict]) -> dict:
-    """把同一种子的多次运行合并成一批请求，再算分位数。
-    合并的是逐请求原始观测值，不是几次分位数的平均。
-    """
+    """把同一种子的多次运行合并成一批再算分位数"""
     rows = [r for run in runs for r in run["per_request"]]
     ttft = [r["ttft_ms"] for r in rows]
     queue = [r["queue_ms"] for r in rows if r["queue_ms"] == r["queue_ms"]]
@@ -146,9 +142,7 @@ def _print_summary(summary: dict) -> None:
         )
 
 
-# ----------------------------------------------------------------------
 # 主流程
-# ----------------------------------------------------------------------
 
 def cmd_run(args) -> None:
     per_seed: dict[int, dict] = {}

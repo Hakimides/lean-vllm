@@ -4,9 +4,7 @@ import torch
 
 @dataclass(slots=True)
 class Context:
-    # 本步要算的 prefill token 数；0 表示整步都是 decode。
-    # 用它取代原来的 is_prefill 布尔量，因为混合批里两者同时存在，
-    # 布尔量表达不了。
+    # 本步要算的 prefill token 数，0 表示整步都是 decode
     num_prefill_tokens: int = 0
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None

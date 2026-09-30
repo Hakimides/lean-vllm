@@ -59,7 +59,7 @@ def build_requests(vocab_size: int, cfg: WorkloadConfig | None = None) -> list[B
     """造一批请求，带计划到达时刻，按到达时刻升序返回"""
     cfg = cfg or WorkloadConfig()
 
-    # 每种形状的输入上界加输出上界都不能超过 max_model_len，否则会撑爆 page table
+    # 每种形状的输入上界加输出上界都不能超过 max_model_len
     for shape in SHAPES:
         assert shape.prompt_hi + shape.output_hi <= cfg.max_model_len, (
             f"{shape.name} 的长度区间上界 {shape.prompt_hi}+{shape.output_hi} "
@@ -77,7 +77,7 @@ def build_requests(vocab_size: int, cfg: WorkloadConfig | None = None) -> list[B
             body.append((
                 shape.name,
                 [rng.randrange(vocab_size) for _ in range(plen)],
-                # ignore_eos 强制跑满指定长度，否则每次总 token 数不同，吞吐没法比
+                # ignore_eos 强制跑满指定长度
                 SamplingParams(temperature=cfg.temperature, ignore_eos=True, max_tokens=olen),
             ))
 
@@ -87,8 +87,7 @@ def build_requests(vocab_size: int, cfg: WorkloadConfig | None = None) -> list[B
     # 泊松到达：间隔服从指数分布，均值 1/lam
     intervals = [rng_arrival.expovariate(cfg.lam) for _ in range(len(body))]
 
-    # 缩放一次，让样本平均到达率正好等于 lam。
-    # 不缩的话有限样本会偏离十几个百分点，不同种子就落在不同负载水平上。
+    # 缩放一次，让样本平均到达率等于 lam
     scale = (1.0 / cfg.lam) / (sum(intervals) / len(intervals))
     t = 0.0
     requests: list[BenchRequest] = []

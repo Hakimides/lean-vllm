@@ -127,17 +127,8 @@ class EngineRunner:
         return page_tables
 
     def prepare_batch(self, seqs: list[Request]):
-        """把一批请求摊平成一维输入，返回 (input_ids, positions, prefill token 数)。
-
-        每条序列按它自己的状态决定这一步算多少 token：
-          prefill（含分块）：从 cached_len 起，长度 scheduled_len
-          decode：          只算最后 1 个 token，但要读到全部历史 KV
-        两类在同一个循环里处理 —— 混合批的元数据就是这样拼出来的。
-
-        对"整批只有一类"的情形，这里构造出的张量和原来的
-        prepare_prefill / prepare_decode 逐一对应、不多不少。
-        """
-        # decode 步要按每条序列各自的 KV 长度去读；prefill 步不用
+        """摊平一批请求，返回 (input_ids, positions, prefill token 数)"""
+        # decode 步按每条序列各自的 KV 长度去读
         is_decode_only = all(not seq.is_prefill for seq in seqs)
 
         input_ids = []
@@ -183,23 +174,21 @@ class EngineRunner:
                     slot_end = seq.page_table[i] * self.page_size + end - i * self.page_size
                 slot_mapping.extend(range(slot_start, slot_end))
 
-        # 这个判断必须用 Python 列表做，换成 tensor 会多一次 GPU 同步
+        # 用 Python 列表判断，避免 GPU 同步
         needs_page_tables = is_decode_only or cu_seqlens_k[-1] > cu_seqlens_q[-1]
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-        # 纯 decode 的步走 flash_attn_with_kvcache，根本不看 cu_seqlens ——
-        # 留着这两个张量只是白做一次 pinned 分配 + H2D，每个 decode 步都要付一遍
+        # 纯 decode 步不构造 cu_seqlens
         if num_prefill_tokens > 0:
             cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
             cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         else:
             cu_seqlens_q = cu_seqlens_k = None
 
-        # decode 步必须有 block_table；prefill 步只有命中前缀缓存时才需要
-        # （没命中时 attention 直接用这一步新算出来的 k/v）
+        # decode 步必须有 block_table，prefill 步仅在命中前缀缓存时需要
         page_tables = self.prepare_page_tables(seqs) if needs_page_tables else None
         if is_decode_only:
             context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -217,9 +206,7 @@ class EngineRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, use_cudagraph: bool):
-        # 只有"整步都是 decode"才走捕获好的图 —— 那些图是按 decode 语义建的
-        # （每行 query_len 都是 1、按 context_lens 读 KV）。混合步的元数据形状
-        # 与它们不同，只能走 eager。
+        # 整步都是 decode 才用 CUDA graph
         if not use_cudagraph:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -239,7 +226,7 @@ class EngineRunner:
 
     def run(self, seqs: list[Request]) -> list[int]:
         input_ids, positions, num_prefill_tokens = self.prepare_batch(seqs)
-        # 整步都是 decode、且批大小在图的覆盖范围内，才用 CUDA graph
+        # 整步都是 decode 且批大小在图的覆盖范围内
         use_cudagraph = (
             num_prefill_tokens == 0
             and not self.enforce_eager
