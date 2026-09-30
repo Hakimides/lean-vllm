@@ -10,6 +10,7 @@ class BatchScheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_prefill_tokens_per_step = config.max_prefill_tokens_per_step
         # 准入时不许动用的页数。num_kvcache_pages 由 runner 在构造本对象之前算好
         self.reserve_pages = int(config.kv_admission_watermark * config.num_kvcache_pages)
         self.eos = config.eos
@@ -64,6 +65,10 @@ class BatchScheduler:
         # 只会把在跑的挤得更惨。但一条都没排上时例外，否则这一步就是空的。
         if not evicted or not scheduled_seqs:
             skipped: list[Request] = []
+            # 这一步只算了一块、prompt 还没算完的序列。它们必须**从队首取出来**，
+            # 否则本轮循环的下一轮又会取到同一条、把同一块重复塞进这一批。
+            # 上限一开就会发生：prompt 永远算不完，队首永远不弹出。
+            unfinished: list[Request] = []
             while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.waiting[0]
                 remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -86,6 +91,10 @@ class BatchScheduler:
                     num_tokens = seq.num_tokens - num_cached_pages * self.page_size
                 else:
                     num_tokens = seq.num_tokens - seq.cached_len
+                # 每步 prefill 的 token 上限：调小它就把长 prompt 的 prefill 摊到多步，
+                # decode 被冻住的时间跟着变短，代价是首 token 变慢
+                if self.max_prefill_tokens_per_step:
+                    num_tokens = min(num_tokens, self.max_prefill_tokens_per_step)
                 # 分块只对本步第一条 prefill 开放
                 if remaining < num_tokens and num_prefill_tokens:
                     break
@@ -98,10 +107,17 @@ class BatchScheduler:
                     seq.status = RequestState.RUNNING
                     self.waiting.popleft()
                     self.running.append(seq)
+                else:
+                    # 只算了一块，先取出来，免得本轮又被取到
+                    self.waiting.popleft()
+                    unfinished.append(seq)
                 scheduled_seqs.append(seq)
             # 本轮跳过的插回队首，保持先来后到
             if skipped:
                 self.waiting.extendleft(reversed(skipped))
+            # 没算完的那条本来就在队首（比"跳过的"更靠前），所以最后放回
+            if unfinished:
+                self.waiting.extendleft(reversed(unfinished))
 
         assert scheduled_seqs
         return scheduled_seqs, num_prefill_tokens, num_decode

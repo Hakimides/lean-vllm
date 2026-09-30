@@ -215,6 +215,8 @@ def main() -> None:
                     help="运行中采 GPU 状态的间隔秒数，0 表示不采")
     ap.add_argument("--kv-watermark", type=float, default=None,
                     help="准入余量：留出的空闲 KV 页比例。不给就沿用引擎默认（0.1 = 10%）")
+    ap.add_argument("--prefill-cap", type=int, default=None,
+                    help="一步里最多给 prefill 多少 token。不给就沿用引擎默认（0 = 不限）")
     ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--out", default=None, help="输出路径，默认写进 benchmarks/results/")
     args = ap.parse_args()
@@ -222,11 +224,13 @@ def main() -> None:
     if not args.model:
         ap.error("没有模型路径：请写 lean-vllm/local_settings.py 或设 MODEL_PATH 环境变量")
 
-    # 不给就沿用引擎默认（config.py 里是 0.1 = 10%），所以只在显式指定时才传 ——
+    # 不给就沿用引擎默认（见 config.py），所以只在显式指定时才传 ——
     # 否则会把引擎的默认值覆盖成"关"。
     engine_kwargs = {}
     if args.kv_watermark is not None:
         engine_kwargs["kv_admission_watermark"] = args.kv_watermark
+    if args.prefill_cap is not None:
+        engine_kwargs["max_prefill_tokens_per_step"] = args.prefill_cap
     llm = LLM(args.model, enforce_eager=False, max_model_len=args.max_model_len,
               **engine_kwargs)
     # 随机 token id 的上界和长度预算都从引擎配置取，和引擎用同一套数
@@ -516,10 +520,11 @@ def main() -> None:
         "workload_desc": workloads.describe(requests),
         "gpu_sample": {"period_s": args.gpu_sample_s},
         # 记引擎里**实际生效**的值，而不是命令行参数 —— 不指定时参数是 None，
-        # 记下来等于没说；这两个是算完之后的真数。
+        # 记下来等于没说；这几个是算完之后的真数。
         "sched_knobs": {
             "kv_admission_watermark": llm.model_runner.config.kv_admission_watermark,
             "reserve_pages": llm.scheduler.reserve_pages,
+            "max_prefill_tokens_per_step": llm.scheduler.max_prefill_tokens_per_step,
         },
         # 暖机报告含预热期的频率轨迹，正式测量关采样时频率信息靠这里
         "warmup": warmup,
