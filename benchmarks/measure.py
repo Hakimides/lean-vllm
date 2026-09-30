@@ -276,8 +276,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     records: list[Rec] = []
     live: list[tuple[object, Rec]] = []      # (引擎里的 seq 对象, 记录)
-    # 每步一行：[prefill token 数, decode 条数, 耗时 ms, 在跑条数, 在等条数]
-    # 一步里两类可以同时有（混合批），所以拆成两列，不再靠符号区分
+    # 每步一行：[prefill token 数, decode 条数, 耗时 ms, 在跑条数, 在等条数, 驻留 token]
+    # 一步里两类可以同时有（混合批），所以拆成两列，不再靠符号区分。
+    # 第 6 列（驻留 token）= 这一步在跑序列的 KV 长度之和 —— 用来把 decode 步耗时按
+    # 「固定 + 每序列×批 + 每 token×驻留 token」分解；「批」单独解释不了它
+    # （实测并发 27 和 29 的步耗时一样）。纯 decode 步里它正好是这一步要读的 KV 总量。
     step_log: list[list] = []
     n_preempt = 0
     n_prefill_steps = n_decode_steps = n_mixed_steps = 0
@@ -325,12 +328,15 @@ def main() -> None:
         _, num_prefill_tokens, num_decode = llm.step()
         e = time.perf_counter()
         step_ms = (e - s) * 1000
+        # 第 6 列：在跑序列的 KV 长度之和。放在末尾，前 5 列含义不变
+        resident_tokens = sum(seq.cached_len for seq in llm.scheduler.running)
         step_log.append([
             num_prefill_tokens,
             num_decode,
             round(step_ms, 3),
             len(llm.scheduler.running),
             len(llm.scheduler.waiting),
+            resident_tokens,
         ])
         prefill_tokens += num_prefill_tokens
         if num_prefill_tokens and num_decode:
