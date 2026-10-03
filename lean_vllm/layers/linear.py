@@ -4,6 +4,35 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 
+FP8_MAX = 448.0          # e4m3 能表示的最大绝对值
+
+
+def quantize_activation(x2: torch.Tensor, act_inv: float) -> torch.Tensor:
+    """按静态 scale 裁剪并量化激活到 fp8"""
+    xq = torch.mul(x2, act_inv)
+    xq = torch.clamp(xq, -FP8_MAX, FP8_MAX)
+    return xq.to(torch.float8_e4m3fn)
+
+
+def fp8_linear(x, weight_fp8_t, weight_scale, act_scale, act_inv, bias):
+    """W8A8 线性层；激活与权重都用 per-tensor 标量 scale"""
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    xq = quantize_activation(x2, act_inv)
+    y = torch._scaled_mm(xq, weight_fp8_t, scale_a=act_scale,
+                         scale_b=weight_scale, out_dtype=torch.bfloat16)
+    y = y.reshape(*shape[:-1], weight_fp8_t.shape[1])
+    if bias is not None:
+        y = y + bias
+    return y
+
+
+def make_act_scale(amax: float, device):
+    """由激活 amax 算出 (scale, 它的倒数)"""
+    scale = max(float(amax), 1e-6) / FP8_MAX
+    return torch.tensor(scale, device=device, dtype=torch.float32).reshape(()), 1.0 / scale
+
+
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
@@ -29,6 +58,33 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+        # 量化后的 fp8 权重；为 None 表示这条线性层走 bf16
+        self.register_buffer("weight_fp8_t", None, persistent=False)
+        self.register_buffer("weight_scale", None, persistent=False)
+        self.register_buffer("act_scale", None, persistent=False)
+        self.act_inv = 1.0      # 激活的乘数（python float，省一次 tensor 派发）
+
+    def quantize_weight(self, act_amax: float):
+        """把权重转成 fp8（标量 scale），并记下该层的激活 scale；重复调用安全"""
+        if self.weight is None:
+            return
+        if act_amax is None:
+            raise ValueError("校准表里没有这一层的激活 amax；先跑 benchmarks/calibrate.py")
+        w = self.weight.data
+        wscale = (w.abs().amax().clamp_min(1e-12) / FP8_MAX).float()
+        wf = w.to(torch.float32)
+        wf.div_(wscale)
+        self.weight_fp8_t = wf.to(torch.float8_e4m3fn).t()
+        self.weight_scale = wscale.reshape(())
+        self.act_scale, self.act_inv = make_act_scale(act_amax, w.device)
+        self.register_parameter("weight", None)
+
+    def _linear(self, x: torch.Tensor, bias) -> torch.Tensor:
+        """量化过走 fp8，否则退回 bf16"""
+        if self.weight_fp8_t is not None:
+            return fp8_linear(x, self.weight_fp8_t, self.weight_scale,
+                              self.act_scale, self.act_inv, bias)
+        return F.linear(x, self.weight, bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -48,7 +104,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self._linear(x, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -70,7 +126,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self._linear(x, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +206,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = self._linear(x, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

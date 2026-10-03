@@ -199,8 +199,30 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.tied_word_embeddings = config.tie_word_embeddings
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+    def quantize_fp8(self, scales: dict):
+        """量化所有线性层与词表矩阵
+
+        scales: {模块名: 该层激活 amax}，由 benchmarks/calibrate.py 产出。
+        """
+        for name, module in self.named_modules():
+            if name == "lm_head" or not hasattr(module, "quantize_weight"):
+                continue
+            if name not in scales:
+                raise ValueError(f"校准表里没有 {name!r}；先跑 benchmarks/calibrate.py")
+            module.quantize_weight(scales[name])
+        if self.tied_word_embeddings:
+            # lm_head 与 embed_tokens 是同一块存储，共用一份 fp8 权重
+            emb = self.model.embed_tokens
+            self.lm_head.weight_fp8 = emb.weight_fp8
+            self.lm_head.weight_scale = emb.weight_scale
+            self.lm_head.register_parameter("weight", None)
+        else:
+            self.lm_head.quantize_weight(scales["lm_head"])
+        self.lm_head.set_act_scale(scales["lm_head"])
 
     def forward(
         self,

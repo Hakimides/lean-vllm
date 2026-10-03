@@ -26,6 +26,9 @@ local_settings.py
 
 # 只在本地保留、不推仓库的部分
 
+# fp8 静态量化的激活校准表：与模型绑定，由 benchmarks/calibrate.py 生成
+fp8_scales.json
+
 # 实验输出的逐请求原始数据：硬件绑定，换机器复现不了，记录以表格形式留档
 benchmarks/results/
 

@@ -1,3 +1,5 @@
+import json
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -10,6 +12,14 @@ from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 from lean_vllm.layers.sampler import Sampler
 from lean_vllm.utils.context import set_context, get_context, reset_context
 from lean_vllm.utils.loader import load_model
+
+
+def load_fp8_scales(path: str) -> dict:
+    """读 fp8 校准表，返回 {模块名: 激活 amax}；读不到直接报错"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"找不到 fp8 校准表 {path}；先跑 benchmarks/calibrate.py")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)["activation_amax"]
 
 
 class EngineRunner:
@@ -30,6 +40,9 @@ class EngineRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        # 在 acquire_kv_cache 之前量化：省下的显存能进 KV 池
+        if config.fp8_linear:
+            self.model.quantize_fp8(load_fp8_scales(config.fp8_scales_path))
         self.sampler = Sampler()
         self.warmup_model()
         self.acquire_kv_cache()

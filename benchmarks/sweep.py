@@ -21,12 +21,14 @@ def _median(values: list[float]) -> float:
     return float(np.median(values)) if values else float("nan")
 
 
-def _run_one(tag: str, seed: int, n: int, lam: float) -> dict:
+def _run_one(tag: str, seed: int, n: int, lam: float, fp8: bool = False) -> dict:
     """跑一次 measure.py，返回它写出来的那份 json。"""
     cmd = [
         sys.executable, "-m", "benchmarks.measure",
         "--tag", tag, "--seed", str(seed), "--n", str(n), "--lam", str(lam),
     ]
+    if fp8:
+        cmd.append("--fp8-linear")
     print(f"\n>>> {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
     return json.loads((RESULTS_DIR / f"{tag}.json").read_text(encoding="utf-8"))
@@ -149,7 +151,8 @@ def cmd_run(args) -> None:
     spread_by_seed: dict[int, dict] = {}
     for seed in args.seeds:
         # 同一个种子连跑完再换下一个：外层种子、内层重复
-        runs = [_run_one(f"{args.tag}_s{seed}_r{r}", seed, args.n, args.lam)
+        runs = [_run_one(f"{args.tag}_s{seed}_r{r}", seed, args.n, args.lam,
+                         args.fp8_linear)
                 for r in range(args.repeats)]
         merged = {}
         merged.update(_pooled_metrics(runs))
@@ -197,6 +200,8 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=2, help="连跑至少两次")
     ap.add_argument("--n", type=int, default=256, help="每轮请求数")
     ap.add_argument("--lam", type=float, default=1.0, help="轻载用 1.0，过载用 4.0")
+    ap.add_argument("--fp8-linear", action="store_true",
+                    help="线性层与词表矩阵用 fp8（W8A8）")
     args = ap.parse_args()
     cmd_run(args)
 

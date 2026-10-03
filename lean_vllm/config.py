@@ -3,6 +3,10 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
+# fp8 校准表的默认位置（仓库根目录）
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 @dataclass(slots=True)
 class Config:
     model: str
@@ -16,6 +20,10 @@ class Config:
     max_prefill_tokens_per_step: int = 1024
     # 收新请求前必须留空的 KV 页比例
     kv_admission_watermark: float = 0.1
+    # 线性层与词表矩阵用 fp8（W8A8）
+    fp8_linear: bool = False
+    # fp8 校准表路径，由 benchmarks/calibrate.py 生成
+    fp8_scales_path: str = os.path.join(_REPO_ROOT, "fp8_scales.json")
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_page_size: int = 256

@@ -217,6 +217,10 @@ def main() -> None:
                     help="准入余量：留出的空闲 KV 页比例。不给就沿用引擎默认（0.1 = 10%）")
     ap.add_argument("--prefill-cap", type=int, default=None,
                     help="一步里最多给 prefill 多少 token。不给就沿用引擎默认（0 = 不限）")
+    ap.add_argument("--fp8-linear", action="store_true",
+                    help="线性层与词表矩阵用 fp8（W8A8）；不给就走 bf16")
+    ap.add_argument("--fp8-scales", default=None,
+                    help="fp8 校准表路径；不给就用引擎默认（仓库根目录 fp8_scales.json）")
     ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--out", default=None, help="输出路径，默认写进 benchmarks/results/")
     args = ap.parse_args()
@@ -230,6 +234,10 @@ def main() -> None:
         engine_kwargs["kv_admission_watermark"] = args.kv_watermark
     if args.prefill_cap is not None:
         engine_kwargs["max_prefill_tokens_per_step"] = args.prefill_cap
+    if args.fp8_linear:
+        engine_kwargs["fp8_linear"] = True
+    if args.fp8_scales is not None:
+        engine_kwargs["fp8_scales_path"] = args.fp8_scales
     llm = LLM(args.model, enforce_eager=False, max_model_len=args.max_model_len,
               **engine_kwargs)
     # 随机 token id 的上界和长度预算都从引擎配置取，和引擎用同一套数
