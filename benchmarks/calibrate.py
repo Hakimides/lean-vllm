@@ -12,6 +12,7 @@ import os
 from transformers import AutoTokenizer
 
 from lean_vllm import LLM, SamplingParams
+from lean_vllm.layers.attention import Attention
 
 try:
     from local_settings import MODEL_PATH
@@ -29,27 +30,36 @@ CALIB_TEXT = """春江潮水连海平，海上明月共潮生。滟滟随波千�
 
 
 def collect_activation_amax(llm: LLM = None, model=None, text: str = None):
-    """跑一遍文本，返回 {模块名: 该模块输入的最大绝对值}"""
+    """跑一遍文本，返回 ({模块名: 输入的最大绝对值}, {k/v 的最大绝对值})"""
     amax: dict[str, float] = {}
+    kv_amax = {"k": 0.0, "v": 0.0}
     hooks = []
     for name, module in model.named_modules():
-        if not hasattr(module, "quantize_weight"):
-            continue
+        if hasattr(module, "quantize_weight"):
 
-        def make(nm):
-            def hook(mod, inputs, output):
-                v = float(inputs[0].detach().abs().amax())
-                if v > amax.get(nm, 0.0):
-                    amax[nm] = v
-            return hook
+            def make(nm):
+                def hook(mod, inputs, output):
+                    v = float(inputs[0].detach().abs().amax())
+                    if v > amax.get(nm, 0.0):
+                        amax[nm] = v
+                return hook
 
-        hooks.append(module.register_forward_hook(make(name)))
+            hooks.append(module.register_forward_hook(make(name)))
+        elif isinstance(module, Attention):
+
+            def kv_hook(mod, args):
+                # Attention.forward(q, k, v)：这里的 k 已过旋转
+                _, k, v = args
+                kv_amax["k"] = max(kv_amax["k"], float(k.detach().abs().amax()))
+                kv_amax["v"] = max(kv_amax["v"], float(v.detach().abs().amax()))
+
+            hooks.append(module.register_forward_pre_hook(kv_hook))
     try:
         llm.generate([text], SamplingParams(temperature=0.6, max_tokens=1), use_tqdm=False)
     finally:
         for h in hooks:
             h.remove()
-    return amax
+    return amax, kv_amax
 
 
 def main() -> None:
@@ -75,16 +85,18 @@ def main() -> None:
 
     # 用引擎自己的模块名，与 quantize_fp8 的遍历一致
     llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1)
-    amax = collect_activation_amax(llm=llm, model=llm.model_runner.model, text=text)
+    amax, kv_amax = collect_activation_amax(llm=llm, model=llm.model_runner.model, text=text)
 
     if not amax:
         raise RuntimeError("一个激活 amax 都没收到，检查 hook 挂对没有")
 
     vals = sorted(amax.values())
     print(f"收到 {len(amax)} 层：最小 {vals[0]:.3g} / 中位 {vals[len(vals)//2]:.3g} / 最大 {vals[-1]:.3g}")
+    print(f"KV amax：k {kv_amax['k']:.3g} / v {kv_amax['v']:.3g}")
 
     with open(out, "w", encoding="utf-8") as f:
-        json.dump({"model": args.model, "n_tokens": n_tok, "activation_amax": amax},
+        json.dump({"model": args.model, "n_tokens": n_tok,
+                   "activation_amax": amax, "kv_amax": kv_amax},
                   f, ensure_ascii=False, indent=1)
     print(f"已写入 {out}")
 

@@ -3,23 +3,26 @@ import os
 import pickle
 import torch
 import torch.distributed as dist
+import triton
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from lean_vllm.config import Config
 from lean_vllm.engine.sequence import Request
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
+from lean_vllm.layers.attention import MIN_WORK_PER_SPLIT
+from lean_vllm.layers.linear import FP8_MAX
 from lean_vllm.layers.sampler import Sampler
 from lean_vllm.utils.context import set_context, get_context, reset_context
 from lean_vllm.utils.loader import load_model
 
 
 def load_fp8_scales(path: str) -> dict:
-    """读 fp8 校准表，返回 {模块名: 激活 amax}；读不到直接报错"""
+    """读 fp8 校准表，返回整个 dict（含 activation_amax 与 kv_amax）；读不到直接报错"""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"找不到 fp8 校准表 {path}；先跑 benchmarks/calibrate.py")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)["activation_amax"]
+        return json.load(f)
 
 
 class EngineRunner:
@@ -40,9 +43,9 @@ class EngineRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
-        # 在 acquire_kv_cache 之前量化：省下的显存能进 KV 池
+        # 量化须在 acquire_kv_cache 之前
         if config.fp8_linear:
-            self.model.quantize_fp8(load_fp8_scales(config.fp8_scales_path))
+            self.model.quantize_fp8(load_fp8_scales(config.fp8_scales_path)["activation_amax"])
         self.sampler = Sampler()
         self.warmup_model()
         self.acquire_kv_cache()
@@ -122,15 +125,41 @@ class EngineRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        page_bytes = 2 * hf_config.num_hidden_layers * self.page_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        kv_dtype = torch.float8_e4m3fn if config.kv_fp8 else hf_config.dtype
+        page_bytes = 2 * hf_config.num_hidden_layers * self.page_size * num_kv_heads * head_dim * kv_dtype.itemsize
         config.num_kvcache_pages = int(total * config.gpu_memory_utilization - used - peak + current) // page_bytes
         assert config.num_kvcache_pages > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_pages, self.page_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_pages, self.page_size, num_kv_heads, head_dim, dtype=kv_dtype)
+        k_scale = v_scale = None
+        if config.kv_fp8:
+            kv_amax = load_fp8_scales(config.fp8_scales_path).get("kv_amax")
+            if kv_amax is None:
+                raise ValueError("校准表里没有 kv_amax；重跑 benchmarks/calibrate.py")
+            k_scale = torch.tensor(kv_amax["k"] / FP8_MAX, device="cuda", dtype=torch.float32).reshape(())
+            v_scale = torch.tensor(kv_amax["v"] / FP8_MAX, device="cuda", dtype=torch.float32).reshape(())
+        num_kv_splits = min(
+            triton.next_power_of_2(max(1, config.max_model_len // MIN_WORK_PER_SPLIT)),
+            torch.cuda.get_device_properties(0).multi_processor_count * 2)
+        scratch = None
+        if config.kv_fp8:
+            # 各层共用一份 split-K 临时缓冲（层顺序执行，可复用）
+            num_heads = hf_config.num_attention_heads // self.world_size
+            scratch = (
+                torch.empty(config.max_num_seqs, num_heads, num_kv_splits, head_dim + 1,
+                            dtype=torch.float32, device="cuda"),
+                torch.empty(config.max_num_seqs, num_heads, dtype=torch.float32, device="cuda"),
+            )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                module.fp8_kv = config.kv_fp8
+                module.page_size = self.page_size
+                module.num_kv_splits = num_kv_splits
+                if scratch is not None:
+                    module.k_scale, module.v_scale = k_scale, v_scale
+                    module.decode_scratch = scratch
                 layer_id += 1
 
     def prepare_page_tables(self, seqs: list[Request]):

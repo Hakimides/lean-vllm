@@ -221,6 +221,8 @@ def main() -> None:
                     help="线性层与词表矩阵用 fp8（W8A8）；不给就走 bf16")
     ap.add_argument("--fp8-scales", default=None,
                     help="fp8 校准表路径；不给就用引擎默认（仓库根目录 fp8_scales.json）")
+    ap.add_argument("--kv-fp8", action="store_true",
+                    help="KV 池用 fp8（写入时量化）；容量翻倍、attention 读字节减半")
     ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--out", default=None, help="输出路径，默认写进 benchmarks/results/")
     args = ap.parse_args()
@@ -238,6 +240,8 @@ def main() -> None:
         engine_kwargs["fp8_linear"] = True
     if args.fp8_scales is not None:
         engine_kwargs["fp8_scales_path"] = args.fp8_scales
+    if args.kv_fp8:
+        engine_kwargs["kv_fp8"] = True
     llm = LLM(args.model, enforce_eager=False, max_model_len=args.max_model_len,
               **engine_kwargs)
     # 随机 token id 的上界和长度预算都从引擎配置取，和引擎用同一套数

@@ -24,6 +24,8 @@ class Config:
     fp8_linear: bool = False
     # fp8 校准表路径，由 benchmarks/calibrate.py 生成
     fp8_scales_path: str = os.path.join(_REPO_ROOT, "fp8_scales.json")
+    # KV 池用 fp8：写入时量化，读字节减半、容量翻倍
+    kv_fp8: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_page_size: int = 256
