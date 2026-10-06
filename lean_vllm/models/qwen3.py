@@ -204,10 +204,7 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def quantize_fp8(self, scales: dict):
-        """量化所有线性层与词表矩阵
-
-        scales: {模块名: 该层激活 amax}，由 benchmarks/calibrate.py 产出。
-        """
+        """量化所有线性层与词表矩阵"""
         for name, module in self.named_modules():
             if name == "lm_head" or not hasattr(module, "quantize_weight"):
                 continue

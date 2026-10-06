@@ -59,7 +59,7 @@ class BatchScheduler:
         # 本步抢占过就不排 prefill
         if not evicted or not scheduled_seqs:
             skipped: list[Request] = []
-            # 没算完的序列先取出来，免得本轮重复取到
+            # 没算完的序列先取出
             unfinished: list[Request] = []
             while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.waiting[0]
@@ -73,7 +73,7 @@ class BatchScheduler:
                         self.waiting.popleft()
                         skipped.append(seq)
                         continue
-                    # 收下它后空闲页不能低于 reserve_pages，否则不再收
+                    # 收下后空闲页不得低于 reserve_pages
                     if (len(self.page_manager.free_page_ids) - (seq.num_pages - num_cached_pages)
                             < self.reserve_pages):
                         break

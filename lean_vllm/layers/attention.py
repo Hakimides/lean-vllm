@@ -34,7 +34,7 @@ def store_kvcache_kernel(
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
     if QUANT:
-        # 写入时量化成 fp8（越界要先 clamp，否则转出 NaN）
+        # 写入时量化成 fp8（越界先 clamp）
         ks = tl.load(k_scale_ptr)
         vs = tl.load(v_scale_ptr)
         key = key.to(tl.float32) / ks
@@ -70,13 +70,13 @@ class Attention(nn.Module):
         super().__init__()
         self.scale = scale
         self.k_cache = self.v_cache = torch.tensor([])
-        # 由 EngineRunner 注入；默认全关，走 flash-attn
+        # 由 EngineRunner 注入；默认全关走 flash-attn
         self.fp8_kv = False
         self.page_size = 256
         self.num_kv_splits = 1
         self.k_scale = torch.ones((), dtype=torch.float32)
         self.v_scale = torch.ones((), dtype=torch.float32)
-        # split-K 临时缓冲，由 runner 分配一份共享的（各层顺序执行）
+        # split-K 临时缓冲，由 runner 分配共享的一份
         self.decode_scratch = None
 
     def _decode_triton(self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor):
@@ -92,7 +92,7 @@ class Attention(nn.Module):
         return o
 
     def _unified(self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor):
-        """含 prefill 的步走 unified（同样吃 fp8 池；混合步不走图，可现算 cu_seqlens）"""
+        """含 prefill 的步走 unified kernel"""
         context = get_context()
         o = torch.empty_like(q)
         used_k = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
@@ -111,7 +111,7 @@ class Attention(nn.Module):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping,
                           self.k_scale, self.v_scale)
         if context.num_prefill_tokens > 0:
-            # 本步含 prefill：池子非空（前缀缓存命中，或批里含 decode）时读池子
+            # 本步含 prefill：池子非空时读池子
             if context.page_tables is not None:
                 if self.fp8_kv:
                     o = self._unified(q, k_cache, v_cache)

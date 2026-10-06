@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
-# fp8 校准表的默认位置（仓库根目录）
+# fp8 校准表默认路径
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -22,10 +22,12 @@ class Config:
     kv_admission_watermark: float = 0.1
     # 线性层与词表矩阵用 fp8（W8A8）
     fp8_linear: bool = False
-    # fp8 校准表路径，由 benchmarks/calibrate.py 生成
+    # fp8 校准表路径
     fp8_scales_path: str = os.path.join(_REPO_ROOT, "fp8_scales.json")
-    # KV 池用 fp8：写入时量化，读字节减半、容量翻倍
+    # KV 池用 fp8（写入时量化）
     kv_fp8: bool = False
+    # 含 prefill 的步按 token 桶进 CUDA graph
+    prefill_graph: bool = True
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_page_size: int = 256

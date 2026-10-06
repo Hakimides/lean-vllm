@@ -31,10 +31,7 @@ class VocabParallelEmbedding(nn.Module):
         self.act_inv = 1.0      # 只有 lm_head 用得上
 
     def quantize_weight(self, act_amax: float | None = None):
-        """把词表矩阵量化成 fp8，存成未转置的 [V, H]；重复调用安全
-
-        act_amax 在这里用不上（查表的"激活"是 token id），只为和 LinearBase 签名一致。
-        """
+        """把词表矩阵量化成 fp8，存成未转置的 [V, H]；重复调用安全"""
         if self.weight is None:
             return
         w = self.weight.data
