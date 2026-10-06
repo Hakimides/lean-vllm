@@ -60,13 +60,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 class Attention(nn.Module):
 
-    def __init__(
-        self,
-        num_heads,
-        head_dim,
-        scale,
-        num_kv_heads,
-    ):
+    def __init__(self, scale):
         super().__init__()
         self.scale = scale
         self.k_cache = self.v_cache = torch.tensor([])

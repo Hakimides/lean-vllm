@@ -8,16 +8,14 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from lean_vllm.config import Config
+from lean_vllm.engine.cuda_graph import GraphRunner
 from lean_vllm.engine.sequence import Request
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 from lean_vllm.layers.attention import MIN_WORK_PER_SPLIT
 from lean_vllm.layers.linear import FP8_MAX
 from lean_vllm.layers.sampler import Sampler
-from lean_vllm.utils.context import set_context, get_context, reset_context
+from lean_vllm.utils.context import reset_context, set_context
 from lean_vllm.utils.loader import load_model
-
-# 含 prefill 的步进图用的 token 桶（只捕小桶）
-PREFILL_BUCKETS = (128, 256, 512, 1024)
 
 
 def load_fp8_scales(path: str) -> dict:
@@ -38,9 +36,7 @@ class EngineRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        # 图的 batch 维上限
-        self.max_graph_seqs = min(config.max_num_seqs, 512)
-        self.prefill_graphs: dict = {}
+        self.cuda_graphs: GraphRunner | None = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -56,7 +52,7 @@ class EngineRunner:
         self.warmup_model()
         self.acquire_kv_cache()
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            self.cuda_graphs = GraphRunner(self.model, config, self.page_size)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -75,8 +71,7 @@ class EngineRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+        self.cuda_graphs = None
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -253,135 +248,27 @@ class EngineRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, use_cudagraph: bool,
-                  bucket: int | None = None):
-        # 含 prefill 的步走按 token 数分桶的图
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor,
+                  decode_key: int | None = None, bucket: int | None = None):
         if bucket is not None:
-            return self._run_model_prefill_graph(input_ids, positions, bucket)
-        # 整步都是 decode 才用 CUDA graph
-        if not use_cudagraph:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            hidden = self.cuda_graphs.replay_prefill(bucket, input_ids, positions)
+        elif decode_key is not None:
+            hidden = self.cuda_graphs.replay_decode(decode_key, input_ids, positions)
         else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["page_tables"][:bs, :context.page_tables.size(1)] = context.page_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
-
-    def _run_model_prefill_graph(self, input_ids: torch.Tensor, positions: torch.Tensor, bucket: int):
-        """含 prefill 的步：把形状对齐到桶再重放图"""
-        ctx = get_context()
-        gv = self.prefill_graphs[bucket]
-        num_tokens = input_ids.size(0)
-        num_seqs = ctx.cu_seqlens_q.numel() - 1
-
-        gv["input_ids"][:num_tokens] = input_ids
-        gv["positions"][:num_tokens] = positions
-        gv["slot_mapping"].fill_(-1)
-        gv["slot_mapping"][:num_tokens] = ctx.slot_mapping
-        gv["cu_seqlens_q"][:num_seqs + 1] = ctx.cu_seqlens_q
-        gv["cu_seqlens_q"][num_seqs + 1:].fill_(int(ctx.cu_seqlens_q[-1]))
-        gv["cu_seqlens_k"][:num_seqs + 1] = ctx.cu_seqlens_k
-        gv["cu_seqlens_k"][num_seqs + 1:].fill_(int(ctx.cu_seqlens_k[-1]))
-        gv["page_tables"][:num_seqs, :ctx.page_tables.size(1)] = ctx.page_tables
-
-        # 图内用对齐后的形状与固定的 max_seqlen_q
-        set_context(bucket, gv["cu_seqlens_q"], gv["cu_seqlens_k"], bucket, bucket,
-                    gv["slot_mapping"], None, gv["page_tables"])
-        gv["graph"].replay()
-        # compute_logits 用真实 cu_seqlens
-        set_context(ctx.num_prefill_tokens, ctx.cu_seqlens_q, ctx.cu_seqlens_k,
-                    ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.slot_mapping,
-                    ctx.context_lens, ctx.page_tables)
-        return self.model.compute_logits(gv["outputs"][:num_tokens])
+            hidden = self.model(input_ids, positions)
+        return self.model.compute_logits(hidden)
 
     def run(self, seqs: list[Request]) -> list[int]:
         input_ids, positions, num_prefill_tokens = self.prepare_batch(seqs)
-        # 整步都是 decode 且批大小在图的覆盖范围内
-        use_cudagraph = (
-            num_prefill_tokens == 0
-            and not self.enforce_eager
-            and len(seqs) <= 512
-        )
+        decode_key = bucket = None
+        if self.cuda_graphs is not None:
+            if num_prefill_tokens:
+                bucket = self.cuda_graphs.pick_prefill(input_ids.size(0), len(seqs))
+            else:
+                decode_key = self.cuda_graphs.pick_decode(len(seqs))
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        # 含 prefill 的步：四个条件都满足才进图
-        bucket = None
-        if num_prefill_tokens > 0 and self.prefill_graphs:
-            context = get_context()
-            num_tokens = input_ids.size(0)
-            if (len(seqs) <= self.max_graph_seqs
-                    and context.page_tables is not None
-                    and context.slot_mapping is not None
-                    and context.slot_mapping.numel() == num_tokens):
-                bucket = next((b for b in sorted(self.prefill_graphs) if b >= num_tokens), None)
-        logits = self.run_model(input_ids, positions, use_cudagraph, bucket)
+        logits = self.run_model(input_ids, positions, decode_key, bucket)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
-    @torch.inference_mode()
-    def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_pages = (config.max_model_len + self.page_size - 1) // self.page_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        page_tables = torch.zeros(max_bs, max_num_pages, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
-
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(0, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], page_tables=page_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            page_tables=page_tables,
-            outputs=outputs,
-        )
-
-        # 每个 token 桶各捕一张；batch 维固定为 max_bs，空位用长度 0 的序列补
-        cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32)
-        cu_seqlens_k = torch.zeros(max_bs + 1, dtype=torch.int32)
-        for bucket in PREFILL_BUCKETS if config.prefill_graph else ():
-            tokens = torch.zeros(bucket, dtype=torch.int64)
-            pos = torch.zeros(bucket, dtype=torch.int64)
-            slots = torch.full((bucket,), -1, dtype=torch.int32)
-            pages = torch.zeros(max_bs, max_num_pages, dtype=torch.int32)
-            out = torch.zeros(bucket, hf_config.hidden_size)
-            set_context(bucket, cu_seqlens_q, cu_seqlens_k, bucket, bucket, slots, None, pages)
-            out[:] = self.model(tokens, pos)                        # warmup
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, self.graph_pool):
-                out[:] = self.model(tokens, pos)                    # capture
-            self.prefill_graphs[bucket] = dict(
-                graph=graph, input_ids=tokens, positions=pos, slot_mapping=slots,
-                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                page_tables=pages, outputs=out,
-            )
-            torch.cuda.synchronize()
-            reset_context()

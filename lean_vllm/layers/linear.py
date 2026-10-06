@@ -1,3 +1,5 @@
+from abc import ABC, abstractmethod
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -38,7 +40,7 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
-class LinearBase(nn.Module):
+class LinearBase(nn.Module, ABC):
 
     def __init__(
         self,
@@ -86,25 +88,9 @@ class LinearBase(nn.Module):
                               self.act_scale, self.act_inv, bias)
         return F.linear(x, self.weight, bias)
 
+    @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
-
-
-class ReplicatedLinear(LinearBase):
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-    ):
-        super().__init__(input_size, output_size, bias)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._linear(x, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
