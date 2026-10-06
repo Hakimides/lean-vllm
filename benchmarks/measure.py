@@ -25,12 +25,12 @@ RESULTS_DIR = Path(__file__).parent / "results"
 
 
 def _pct(values: list[float], q: float) -> float:
-    """分位数，没数据时返回 nan 免得抛异常"""
+    """分位数，没数据返回 nan"""
     return float(np.percentile(values, q)) if values else float("nan")
 
 
 def _git_provenance() -> dict:
-    """这份数据是哪次提交跑出来的，dirty 表示当时有未提交改动"""
+    """这份数据对应的 git 提交；dirty 表示当时有未提交改动"""
     root = Path(__file__).resolve().parent.parent
     try:
         commit = subprocess.run(
@@ -150,7 +150,7 @@ def _clock_ramp(samples: list[list], window_s: float = 30.0,
 def _warmup_gpu(llm: LLM, vocab_size: int, seconds: float, target_inflight: int,
                 seed: int, max_model_len: int, tol_mhz: float,
                 period_s: float = 2.0) -> dict:
-    """GPU 暖机：用持续饱和负载把频率顶上去，期间采频率判断有没有稳"""
+    """GPU 暖机：用饱和负载顶频率，期间采频率"""
     pool = workloads.build_requests(
         vocab_size,
         workloads.WorkloadConfig(n_requests=512, lam=4.0, seed=seed,
@@ -163,13 +163,13 @@ def _warmup_gpu(llm: LLM, vocab_size: int, seconds: float, target_inflight: int,
     while True:
         elapsed = time.perf_counter() - t0
         inflight = len(llm.scheduler.running) + len(llm.scheduler.waiting)
-        # 补足在跑条数；引擎可能因为页不够拒绝受理，那 inflight 就不再涨
+        # 补足在跑条数
         while inflight < target_inflight and idx < len(pool):
             req = pool[idx]
             llm.add_request(req.prompt_ids, req.sampling)
             idx += 1
             inflight += 1
-        # 引擎空着时 step() 会触发调度器的 assert，必须先判这个
+        # 引擎空着时不能 step()
         if inflight == 0 and idx >= len(pool):
             break
         if elapsed >= seconds:
@@ -223,6 +223,8 @@ def main() -> None:
                     help="fp8 校准表路径；不给就用引擎默认（仓库根目录 fp8_scales.json）")
     ap.add_argument("--kv-fp8", action="store_true",
                     help="KV 池用 fp8（写入时量化）；容量翻倍、attention 读字节减半")
+    ap.add_argument("--no-prefill-graph", action="store_true",
+                    help="关掉含 prefill 的步进图（改前改后对照用）")
     ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--out", default=None, help="输出路径，默认写进 benchmarks/results/")
     args = ap.parse_args()
@@ -242,9 +244,11 @@ def main() -> None:
         engine_kwargs["fp8_scales_path"] = args.fp8_scales
     if args.kv_fp8:
         engine_kwargs["kv_fp8"] = True
+    if args.no_prefill_graph:
+        engine_kwargs["prefill_graph"] = False
     llm = LLM(args.model, enforce_eager=False, max_model_len=args.max_model_len,
               **engine_kwargs)
-    # 随机 token id 的上界和长度预算都从引擎配置取，和引擎用同一套数
+    # 随机 token id 的上界与长度预算取自引擎配置
     cfg = workloads.WorkloadConfig(
         n_requests=args.n,
         lam=args.lam,
@@ -279,7 +283,7 @@ def main() -> None:
                 print(f"  频率还在爬升（|{ramp['delta_mhz']:+.0f}| > "
                       f"{args.warmup_clock_tol:.0f} MHz），把 --warmup-gpu-s 调大再跑")
     if torch.cuda.is_available():
-        # 放在暖机之后，避免把预热的峰值算进去
+        # 放在暖机之后
         torch.cuda.reset_peak_memory_stats()
 
     # 主循环：按到达时刻表提交，自己驱动 step()
@@ -321,7 +325,7 @@ def main() -> None:
             idle_s += time.perf_counter() - t_idle
             continue
 
-        # 3 采样 GPU 状态。放在 step 计时之外，不污染步耗时
+        # 3 采样 GPU 状态（在 step 计时之外）
         if args.gpu_sample_s > 0 and elapsed >= next_gpu_sample:
             st = _gpu_state()
             if st:
@@ -333,7 +337,7 @@ def main() -> None:
         _, num_prefill_tokens, num_decode = llm.step()
         e = time.perf_counter()
         step_ms = (e - s) * 1000
-        # 第 6 列：在跑序列的 KV 长度之和。放在末尾，前 5 列含义不变
+        # 第 6 列：在跑序列的 KV 长度之和
         resident_tokens = sum(seq.cached_len for seq in llm.scheduler.running)
         step_log.append([
             num_prefill_tokens,
@@ -406,7 +410,7 @@ def main() -> None:
     total_out = sum(r["n_out"] for r in per_request)
     prompt_tokens = sum(len(req.prompt_ids) for req in requests)
     overall = _summarize(per_request)
-    # 吞吐用整轮口径（总输出除以总实际耗时）
+    # 吞吐用整轮口径
     overall["throughput"] = {
         "output_tok_s": total_out / wall,
         "total_tok_s": (total_out + prompt_tokens) / wall,
@@ -429,7 +433,7 @@ def main() -> None:
     }
     overall["idle_s"] = idle_s
 
-    # 批大小用于解释 decode 效率，队列深度是排队的直接证据
+    # 批大小与队列深度
     runnings = [row[3] for row in step_log]
     waitings = [row[4] for row in step_log]
     overall["concurrency"] = {
@@ -455,7 +459,7 @@ def main() -> None:
         }
         overall["memory"] = memory
 
-    # KV 容量是解释结果的关键，待处理 token 总量超过它就只能靠抢占加重算腾地方
+    # KV 容量与待处理 token 总量
     page_size = llm.scheduler.page_size
     num_pages = llm.model_runner.config.num_kvcache_pages
     kv_capacity = num_pages * page_size
@@ -524,7 +528,7 @@ def main() -> None:
             "reserve_pages": llm.scheduler.reserve_pages,
             "max_prefill_tokens_per_step": llm.scheduler.max_prefill_tokens_per_step,
         },
-        # 暖机报告含预热期的频率轨迹，正式测量关采样时频率信息靠这里
+        # 暖机报告含预热期的频率轨迹
         "warmup": warmup,
         "env": {
             "torch": torch.__version__,

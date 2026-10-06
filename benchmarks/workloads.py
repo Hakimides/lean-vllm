@@ -81,7 +81,7 @@ def build_requests(vocab_size: int, cfg: WorkloadConfig | None = None) -> list[B
                 SamplingParams(temperature=cfg.temperature, ignore_eos=True, max_tokens=olen),
             ))
 
-    # 打散，让每次到达落到哪种形状是随机的
+    # 打散形状
     rng.shuffle(body)
 
     # 泊松到达：间隔服从指数分布，均值 1/lam
@@ -98,7 +98,7 @@ def build_requests(vocab_size: int, cfg: WorkloadConfig | None = None) -> list[B
 
 
 def describe(requests: list[BenchRequest]) -> str:
-    """这批请求的规模，写进实验记录用"""
+    """这批请求的规模"""
     prompt_lens = [len(r.prompt_ids) for r in requests]
     out_lens = [r.sampling.max_tokens for r in requests]
     span = max(r.arrival for r in requests)
@@ -111,7 +111,7 @@ def describe(requests: list[BenchRequest]) -> str:
 
 
 def shape_table(requests: list[BenchRequest]) -> str:
-    """按形状列出条数和长度，核对配比有没有落对"""
+    """按形状列出条数和长度"""
     lines = []
     for shape in SHAPES:
         group = [r for r in requests if r.shape == shape.name]

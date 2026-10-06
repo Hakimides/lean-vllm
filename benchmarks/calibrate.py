@@ -1,8 +1,4 @@
-"""生成 fp8 静态量化用的激活校准表。
-
-跑一遍校准文本，记录每个线性层输入的 amax，写成 fp8_scales.json。
-产物与模型绑定，被 .gitignore 挡住。
-"""
+"""生成 fp8 静态量化用的激活校准表，写成 fp8_scales.json"""
 from __future__ import annotations
 
 import argparse
@@ -83,7 +79,7 @@ def main() -> None:
     n_tok = len(AutoTokenizer.from_pretrained(args.model, use_fast=True).encode(text))
     print(f"校准文本 {n_tok} token")
 
-    # 用引擎自己的模块名，与 quantize_fp8 的遍历一致
+    # 用引擎自己的模块名
     llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1)
     amax, kv_amax = collect_activation_amax(llm=llm, model=llm.model_runner.model, text=text)
 

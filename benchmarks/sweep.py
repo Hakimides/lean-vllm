@@ -21,14 +21,22 @@ def _median(values: list[float]) -> float:
     return float(np.median(values)) if values else float("nan")
 
 
-def _run_one(tag: str, seed: int, n: int, lam: float, fp8: bool = False) -> dict:
-    """跑一次 measure.py，返回它写出来的那份 json。"""
+def _run_one(tag: str, seed: int, n: int, lam: float, fp8: bool = False,
+             no_prefill_graph: bool = False, kv_fp8: bool = False,
+             warmup_gpu_s: float | None = None) -> dict:
+    """跑一次 measure.py，返回它写出的 json"""
     cmd = [
         sys.executable, "-m", "benchmarks.measure",
         "--tag", tag, "--seed", str(seed), "--n", str(n), "--lam", str(lam),
     ]
     if fp8:
         cmd.append("--fp8-linear")
+    if kv_fp8:
+        cmd.append("--kv-fp8")
+    if no_prefill_graph:
+        cmd.append("--no-prefill-graph")
+    if warmup_gpu_s is not None:
+        cmd += ["--warmup-gpu-s", str(warmup_gpu_s)]
     print(f"\n>>> {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
     return json.loads((RESULTS_DIR / f"{tag}.json").read_text(encoding="utf-8"))
@@ -78,7 +86,7 @@ def _runlevel_metrics(runs: list[dict]) -> dict:
 
 
 def _run_spread(runs: list[dict]) -> dict:
-    """同一配置重跑之间的相对差，这就是噪声底"""
+    """同一配置重跑之间的相对差"""
     items = {
         "输出吞吐": lambda o: o["throughput"]["output_tok_s"],
         "TTFT p50": lambda o: o["ttft_ms"]["p50"],
@@ -118,7 +126,7 @@ def _summarize(prefix: str, per_seed: dict[int, dict], meta: dict) -> dict:
 
 
 def _warmup_cell(run: dict) -> str:
-    """暖机判稳的验收。"""
+    """暖机判稳"""
     ramp = ((run.get("warmup") or {}).get("ramp")) or {}
     if not ramp:
         return "-"
@@ -152,7 +160,8 @@ def cmd_run(args) -> None:
     for seed in args.seeds:
         # 同一个种子连跑完再换下一个：外层种子、内层重复
         runs = [_run_one(f"{args.tag}_s{seed}_r{r}", seed, args.n, args.lam,
-                         args.fp8_linear)
+                         args.fp8_linear, args.no_prefill_graph, args.kv_fp8,
+                         args.warmup_gpu_s)
                 for r in range(args.repeats)]
         merged = {}
         merged.update(_pooled_metrics(runs))
@@ -202,6 +211,12 @@ def main() -> None:
     ap.add_argument("--lam", type=float, default=1.0, help="轻载用 1.0，过载用 4.0")
     ap.add_argument("--fp8-linear", action="store_true",
                     help="线性层与词表矩阵用 fp8（W8A8）")
+    ap.add_argument("--no-prefill-graph", action="store_true",
+                    help="关掉含 prefill 的步进图（改前改后对照用）")
+    ap.add_argument("--kv-fp8", action="store_true",
+                    help="KV 池用 fp8（写入时量化）")
+    ap.add_argument("--warmup-gpu-s", type=float, default=None,
+                    help="GPU 暖机秒数；不给就沿用 measure.py 默认（45）")
     args = ap.parse_args()
     cmd_run(args)
 
