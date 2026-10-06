@@ -3,17 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 
 from transformers import AutoTokenizer
 
 from lean_vllm import LLM, SamplingParams
 from lean_vllm.layers.attention import Attention
 
-try:
-    from local_settings import MODEL_PATH
-except ImportError:
-    MODEL_PATH = os.environ.get("MODEL_PATH", "")
+from benchmarks.common import FP8_SCALES_PATH, resolve_model_path
 
 # 校准文本（古文长诗）
 CALIB_TEXT = """春江潮水连海平，海上明月共潮生。滟滟随波千万里，何处春江无月明。
@@ -60,7 +56,7 @@ def collect_activation_amax(llm: LLM = None, model=None, text: str = None):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="生成 fp8 静态量化的激活校准表")
-    ap.add_argument("--model", default=MODEL_PATH)
+    ap.add_argument("--model", default=resolve_model_path())
     ap.add_argument("--out", default=None, help="输出路径，默认写进仓库根目录 fp8_scales.json")
     ap.add_argument("--text", default=None, help="自定义校准文本文件（默认用内置的一段中文）")
     args = ap.parse_args()
@@ -73,8 +69,7 @@ def main() -> None:
         with open(args.text, encoding="utf-8") as f:
             text = f.read()
 
-    out = args.out or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fp8_scales.json")
+    out = args.out or str(FP8_SCALES_PATH)
 
     n_tok = len(AutoTokenizer.from_pretrained(args.model, use_fast=True).encode(text))
     print(f"校准文本 {n_tok} token")

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import subprocess
 import time
@@ -14,19 +13,8 @@ import torch
 
 from lean_vllm import LLM
 
-from benchmarks import workloads
-
-try:
-    from local_settings import MODEL_PATH
-except ImportError:
-    MODEL_PATH = os.environ.get("MODEL_PATH", "")
-
-RESULTS_DIR = Path(__file__).parent / "results"
-
-
-def _pct(values: list[float], q: float) -> float:
-    """分位数，没数据返回 nan"""
-    return float(np.percentile(values, q)) if values else float("nan")
+from benchmarks import metrics, workloads
+from benchmarks.common import RESULTS_DIR, resolve_model_path
 
 
 def _git_provenance() -> dict:
@@ -90,33 +78,6 @@ class Rec:
     token_times: list[float] = field(default_factory=list)
     had_pages: bool = False             # 用来识别被抢占
     n_preempt: int = 0                  # 这条被抢占了几次
-
-
-def _summarize(reqs: list[dict]) -> dict:
-    """把逐条数据汇总成分位数"""
-    def col(key):
-        return [r[key] for r in reqs if r[key] == r[key]]      # 顺手滤掉 nan
-
-    ttft, queue, prefill = col("ttft_ms"), col("queue_ms"), col("prefill_ms")
-    e2e = col("e2e_ms")
-    itls = [x for r in reqs for x in r["itls"]]
-    return {
-        "n": len(reqs),
-        "output_tokens": sum(r["n_out"] for r in reqs),
-        "ttft_ms": {
-            "p50": _pct(ttft, 50), "p99": _pct(ttft, 99),
-            "mean": float(np.mean(ttft)) if ttft else float("nan"),
-            "max": max(ttft) if ttft else float("nan"),
-        },
-        "queue_ms": {"p50": _pct(queue, 50), "p99": _pct(queue, 99)},
-        "prefill_ms": {"p50": _pct(prefill, 50), "p99": _pct(prefill, 99)},
-        "e2e_ms": {"p50": _pct(e2e, 50), "p99": _pct(e2e, 99)},
-        "itl_ms": {
-            "p50": _pct(itls, 50), "p99": _pct(itls, 99),
-            "mean": float(np.mean(itls)) if itls else float("nan"),
-            "max": max(itls) if itls else float("nan"),
-        },
-    }
 
 
 def _drain(llm: LLM) -> None:
@@ -225,7 +186,7 @@ def main() -> None:
                     help="KV 池用 fp8（写入时量化）；容量翻倍、attention 读字节减半")
     ap.add_argument("--no-prefill-graph", action="store_true",
                     help="关掉含 prefill 的步进图（改前改后对照用）")
-    ap.add_argument("--model", default=MODEL_PATH)
+    ap.add_argument("--model", default=resolve_model_path())
     ap.add_argument("--out", default=None, help="输出路径，默认写进 benchmarks/results/")
     args = ap.parse_args()
 
@@ -409,7 +370,7 @@ def main() -> None:
 
     total_out = sum(r["n_out"] for r in per_request)
     prompt_tokens = sum(len(req.prompt_ids) for req in requests)
-    overall = _summarize(per_request)
+    overall = metrics.summarize_requests(per_request)
     # 吞吐用整轮口径
     overall["throughput"] = {
         "output_tok_s": total_out / wall,
@@ -444,12 +405,6 @@ def main() -> None:
 
     # 重算量 = prefill 处理的 token 减去原始 prompt 总量
     overall["recompute_tokens"] = prefill_tokens - prompt_tokens
-
-    overall["arrival_lag_ms"] = {
-        "p50": _pct([r["arrival_lag_ms"] for r in per_request], 50),
-        "p99": _pct([r["arrival_lag_ms"] for r in per_request], 99),
-        "max": max((r["arrival_lag_ms"] for r in per_request), default=float("nan")),
-    }
 
     memory = None
     if torch.cuda.is_available():
@@ -527,6 +482,12 @@ def main() -> None:
             "kv_admission_watermark": llm.model_runner.config.kv_admission_watermark,
             "reserve_pages": llm.scheduler.reserve_pages,
             "max_prefill_tokens_per_step": llm.scheduler.max_prefill_tokens_per_step,
+        },
+        # 这一轮开了哪些开关
+        "engine_flags": {
+            "fp8_linear": llm.model_runner.config.fp8_linear,
+            "kv_fp8": llm.model_runner.config.kv_fp8,
+            "prefill_graph": llm.model_runner.config.prefill_graph,
         },
         # 暖机报告含预热期的频率轨迹
         "warmup": warmup,

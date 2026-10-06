@@ -4,21 +4,16 @@ import argparse
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import numpy as np
 
-RESULTS_DIR = Path(__file__).parent / "results"
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from benchmarks import metrics
+from benchmarks.common import REPO_ROOT, RESULTS_DIR, load_run
 
 
 def _pad(text: str, width: int) -> str:
     shown = sum(2 if ord(c) > 0x2E80 else 1 for c in text)
     return text + " " * max(1, width - shown)
-
-
-def _median(values: list[float]) -> float:
-    return float(np.median(values)) if values else float("nan")
 
 
 def _run_one(tag: str, seed: int, n: int, lam: float, fp8: bool = False,
@@ -39,90 +34,22 @@ def _run_one(tag: str, seed: int, n: int, lam: float, fp8: bool = False,
         cmd += ["--warmup-gpu-s", str(warmup_gpu_s)]
     print(f"\n>>> {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
-    return json.loads((RESULTS_DIR / f"{tag}.json").read_text(encoding="utf-8"))
-
-
-# 汇总
-
-def _pooled_metrics(runs: list[dict]) -> dict:
-    """把同一种子的多次运行合并成一批再算分位数"""
-    rows = [r for run in runs for r in run["per_request"]]
-    ttft = [r["ttft_ms"] for r in rows]
-    queue = [r["queue_ms"] for r in rows if r["queue_ms"] == r["queue_ms"]]
-    prefill = [r["prefill_ms"] for r in rows if r["prefill_ms"] == r["prefill_ms"]]
-    e2e = [r["e2e_ms"] for r in rows]
-    itls = [x for r in rows for x in r["itls"]]
-    lag = [r["arrival_lag_ms"] for r in rows]
-    return {
-        "TTFT p50": float(np.percentile(ttft, 50)),
-        "TTFT p99": float(np.percentile(ttft, 99)),
-        "排队 p50": float(np.percentile(queue, 50)) if queue else float("nan"),
-        "prefill p50": float(np.percentile(prefill, 50)) if prefill else float("nan"),
-        "E2E p99": float(np.percentile(e2e, 99)) if e2e else float("nan"),
-        "ITL p50": float(np.percentile(itls, 50)) if itls else float("nan"),
-        "ITL p99": float(np.percentile(itls, 99)) if itls else float("nan"),
-        "ITL max": max(itls) if itls else float("nan"),
-        "到达偏差 p99": float(np.percentile(lag, 99)) if lag else float("nan"),
-    }
-
-
-def _runlevel_metrics(runs: list[dict]) -> dict:
-    """只能整轮取中位数的指标（吞吐、抢占次数这类）。"""
-
-    def med(fn) -> float:
-        return _median([fn(r["overall"]) for r in runs])
-
-    return {
-        "输出吞吐": med(lambda o: o["throughput"]["output_tok_s"]),
-        "总吞吐": med(lambda o: o["throughput"]["total_tok_s"]),
-        "抢占次数": med(lambda o: float(o["n_preemptions"])),
-        "重算token": med(lambda o: float(o["recompute_tokens"])),
-        "最大并发": med(lambda o: float(o["concurrency"]["max_running"])),
-        "队列最深": med(lambda o: float(o["concurrency"]["max_waiting"])),
-        "实际耗时 s": med(lambda o: o["wall_s"]),
-        "decode占比%": med(lambda o: 100 * o["phase_ms"]["decode_total"] / 1000 / o["wall_s"]),
-        "空闲占比%": med(lambda o: 100 * o["idle_s"] / o["wall_s"]),
-    }
-
-
-def _run_spread(runs: list[dict]) -> dict:
-    """同一配置重跑之间的相对差"""
-    items = {
-        "输出吞吐": lambda o: o["throughput"]["output_tok_s"],
-        "TTFT p50": lambda o: o["ttft_ms"]["p50"],
-        "排队 p50": lambda o: o["queue_ms"]["p50"],
-        "prefill p50": lambda o: o["prefill_ms"]["p50"],
-        "E2E p99": lambda o: o["e2e_ms"]["p99"],
-        "ITL p50": lambda o: o["itl_ms"]["p50"],
-        "ITL p99": lambda o: o["itl_ms"]["p99"],
-        "ITL max": lambda o: o["itl_ms"]["max"],
-        "抢占次数": lambda o: o["n_preemptions"],
-        "重算token": lambda o: o["recompute_tokens"],
-        "最大并发": lambda o: o["concurrency"]["max_running"],
-        "队列最深": lambda o: o["concurrency"]["max_waiting"],
-        "实际耗时 s": lambda o: o["wall_s"],
-    }
-    out = {}
-    for name, fn in items.items():
-        v = [fn(r["overall"]) for r in runs]
-        mid = _median(v)
-        out[name] = ((max(v) - min(v)) / mid * 100) if mid else float("nan")
-    return out
+    return load_run(tag)
 
 
 def _summarize(prefix: str, per_seed: dict[int, dict], meta: dict) -> dict:
     """跨种子汇总：每个指标给出各种子的值 + 中位数 + 极差。"""
     names = list(next(iter(per_seed.values())).keys())
-    metrics = {}
+    table = {}
     for name in names:
         values = [per_seed[s][name] for s in sorted(per_seed)]
-        metrics[name] = {
+        table[name] = {
             "per_seed": values,
-            "median": _median(values),
+            "median": float(np.median(values)),
             "min": min(values),
             "max": max(values),
         }
-    return {"prefix": prefix, "seeds": sorted(per_seed), **meta, "metrics": metrics}
+    return {"prefix": prefix, "seeds": sorted(per_seed), **meta, "metrics": table}
 
 
 def _warmup_cell(run: dict) -> str:
@@ -163,9 +90,9 @@ def cmd_run(args) -> None:
                          args.fp8_linear, args.no_prefill_graph, args.kv_fp8,
                          args.warmup_gpu_s)
                 for r in range(args.repeats)]
-        merged = {}
-        merged.update(_pooled_metrics(runs))
-        merged.update(_runlevel_metrics(runs))
+        pooled = [row for run in runs for row in run["per_request"]]
+        merged = {**metrics.flat(metrics.summarize_requests(pooled)),
+                  **metrics.summarize_runs(runs)}
         per_seed[seed] = merged
 
         print(f"\n--- 种子 {seed}：逐次运行 ---")
@@ -180,7 +107,7 @@ def cmd_run(args) -> None:
                 + _warmup_cell(run)
             )
 
-        spread = _run_spread(runs)
+        spread = metrics.spread(runs)
         spread_by_seed[seed] = spread
         print(f"\n--- 种子 {seed}：重跑差异（极差/中位），这就是噪声底 ---")
         for k, v in spread.items():
