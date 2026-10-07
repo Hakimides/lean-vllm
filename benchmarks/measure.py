@@ -111,7 +111,7 @@ def _clock_ramp(samples: list[list], window_s: float = 30.0,
 def _warmup_gpu(llm: LLM, vocab_size: int, seconds: float, target_inflight: int,
                 seed: int, max_model_len: int, tol_mhz: float,
                 period_s: float = 2.0) -> dict:
-    """GPU 暖机：用饱和负载顶频率，期间采频率"""
+    """GPU 暖机：用饱和负载拉升频率，期间采频率"""
     pool = workloads.build_requests(
         vocab_size,
         workloads.WorkloadConfig(n_requests=512, lam=4.0, seed=seed,
@@ -165,7 +165,7 @@ def main() -> None:
     ap.add_argument("--lam", type=float, default=4.0, help="平均到达率，条每秒")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--warmup-gpu-s", type=float, default=45.0,
-                    help="GPU 暖机用持续饱和负载顶频率的秒数，0 表示不做")
+                    help="GPU 暖机用持续饱和负载拉升频率的秒数，0 表示不做")
     ap.add_argument("--warmup-inflight", type=int, default=32,
                     help="预热期间保持多少条请求在跑")
     ap.add_argument("--warmup-clock-tol", type=float, default=60.0,

@@ -74,7 +74,7 @@ class Attention(nn.Module):
         self.decode_scratch = None
 
     def _decode_triton(self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor):
-        """纯 decode 走 Triton kernel（能吃 fp8 池，也能进 CUDA graph）"""
+        """纯 decode 走 Triton kernel（支持 fp8 池，也能进 CUDA graph）"""
         context = get_context()
         batch = q.shape[0]
         logits, lse = self.decode_scratch
