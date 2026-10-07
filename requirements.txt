@@ -1,0 +1,23 @@
+# 本项目在 Python 3.12 / CUDA 12.8 / RTX 4060 Laptop（sm_89）上验证。
+# torch 的 cu128 wheel 只在 PyTorch 官方索引里，下面这行把该索引加进来。
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# 引擎与 kernel
+torch==2.9.1+cu128
+triton==3.5.1
+
+# 模型加载与分词
+transformers==5.17.0
+safetensors==0.8.0
+tokenizers==0.23.2
+
+# 测量设施
+numpy==2.5.3
+xxhash==4.0.1
+tqdm==4.70.1
+packaging==26.3
+
+# ── flash-attn 需要单独装，故不列在上面 ──
+# 它在 PyPI 上只有源码包（实测：无任何 wheel），留在上面会让 pip install -r 触发源码编译并失败；
+# 而编译又必须关掉构建隔离，否则构建环境里看不到 torch。装法（约 30~60 分钟）：
+#   pip install flash-attn==2.8.3 --no-build-isolation
