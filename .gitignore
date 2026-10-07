@@ -1,30 +1,26 @@
-# Byte-compiled / cached
+# Python 缓存与字节码
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 
-# Packaging / build
-.Python
-build/
-dist/
-sdist/
-wheels/
-*.egg-info/
-.eggs/
-MANIFEST
-
-# Virtual environments
+# 虚拟环境
 .venv
 venv/
 env/
 ENV/
 .env
 
-# Machine-local settings (model paths, etc.)
+# 本机设置（模型路径等）
 local_settings.py
 
-# 只在本地保留、不推仓库的部分
+# 编辑器 / IDE
+.idea/
+.vscode/
+
+# 系统
+.DS_Store
+
+# ── 只在本地保留、不推仓库的部分 ──
 
 # fp8 静态量化的激活校准表：与模型绑定，由 benchmarks/calibrate.py 生成
 fp8_scales.json
@@ -32,35 +28,11 @@ fp8_scales.json
 # 实验输出的逐请求原始数据：硬件绑定，换机器复现不了，记录以表格形式留档
 benchmarks/results/
 
-# 过程记录与规范文档
+# 阶段基线的本地留档：summary json 与阶段说明都是硬件绑定的本地记录，不入库
+benchmarks/baselines/
+
+# 过程记录与历史决策：写 README 的素材，不是对外文档
 过程收获.md
 vLLM对照_调度策略.md
 混合批优化.md
-benchmarks/测试标准.md
 benchmarks/基线结果/
-
-# Logs
-*.log
-
-# Test / coverage
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-cover/
-
-# Type checkers
-.mypy_cache/
-.dmypy.json
-.pyre/
-.pytype/
-
-# Editors / IDEs
-.idea/
-.vscode/
-.spyderproject
-.ropeproject
-
-# OS
-.DS_Store
